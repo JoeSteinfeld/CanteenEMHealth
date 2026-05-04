@@ -56,6 +56,12 @@ function buildSamsaraSensorEnvironmentUrl(orgId: string, sensorName: string): st
   return `https://cloud.samsara.com/o/${encodeURIComponent(orgId)}/fleet/environment?q=${q}&view=sensors&duration=${SAMSARA_ENV_WINDOW_SEC}&end_ms=${endMs}`;
 }
 
+/** Opens Fleet → Config → Sensors in Samsara Cloud; `q` is the sensor name. */
+function buildSamsaraSensorConfigSensorsUrl(orgId: string, sensorName: string): string {
+  const q = encodeURIComponent(sensorName);
+  return `https://cloud.samsara.com/o/${encodeURIComponent(orgId)}/fleet/config/sensors?q=${q}`;
+}
+
 function hasColumnSearch(filters: Record<TableColumnKey, string>): boolean {
   return TABLE_COLUMNS.some((c) => filters[c.key].trim() !== "");
 }
@@ -722,7 +728,21 @@ export default function App() {
                     }
                   >
                     <td className="tags-cell">{r.tagValue}</td>
-                    <td className="mono">{r.id}</td>
+                    <td className="mono">
+                      {samsaraOrgId != null && r.name.trim() !== "" ? (
+                        <a
+                          className="sensor-cloud-link"
+                          href={buildSamsaraSensorConfigSensorsUrl(samsaraOrgId, r.name)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          title="Open sensor configuration in Samsara Cloud (search by name)"
+                        >
+                          {r.id}
+                        </a>
+                      ) : (
+                        r.id
+                      )}
+                    </td>
                     <td>
                       {samsaraOrgId != null && r.name.trim() !== "" ? (
                         <a
