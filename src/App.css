@@ -607,3 +607,269 @@ table.grid tbody tr.row-battery-low-recent:nth-child(even) {
   outline-offset: 1px;
   background: #fff;
 }
+
+/* Match td.mono: .linkish alone uses 0.85rem and breaks table typography */
+button.temp-history-btn {
+  font: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  font-variant-numeric: inherit;
+  font-family: inherit;
+  border-radius: 0;
+  text-underline-offset: 2px;
+}
+
+.temp-history-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  background: rgba(15, 23, 42, 0.45);
+}
+
+.temp-history-panel {
+  width: min(1270px, 100%);
+  max-height: min(90vh, 640px);
+  overflow: auto;
+  background: #fff;
+  border-radius: 12px;
+  border: 1px solid #e2e8f0;
+  box-shadow: 0 20px 50px rgba(15, 23, 42, 0.18);
+  padding: 1rem 1.15rem 1.25rem;
+}
+
+.temp-history-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.temp-history-title {
+  margin: 0;
+  font-size: 1.15rem;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.temp-history-sub {
+  margin: 0.25rem 0 0;
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+.temp-history-sub code {
+  font-size: 0.85em;
+  background: #f1f5f9;
+  padding: 0.05em 0.3em;
+  border-radius: 4px;
+}
+
+button.temp-history-close {
+  flex-shrink: 0;
+  border: none;
+  background: #f1f5f9;
+  color: #475569;
+  width: 2.25rem;
+  height: 2.25rem;
+  border-radius: 8px;
+  font-size: 1.35rem;
+  line-height: 1;
+  padding: 0;
+}
+
+button.temp-history-close:hover {
+  background: #e2e8f0;
+  color: #0f172a;
+}
+
+.temp-history-status {
+  margin: 0.5rem 0;
+}
+
+.temp-history-err {
+  margin-top: 0.5rem;
+}
+
+.temp-history-body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 1rem 1.25rem;
+  margin-top: 0.5rem;
+}
+
+.temp-history-chart-wrap {
+  flex: 1 1 368px;
+  min-width: 0;
+}
+
+.temp-history-chart {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 280px;
+}
+
+.temp-history-chart-empty {
+  min-height: 200px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px dashed #cbd5e1;
+  border-radius: 8px;
+  font-size: 0.9rem;
+}
+
+.temp-history-grid {
+  stroke: #e2e8f0;
+  stroke-width: 1;
+}
+
+.temp-history-line {
+  stroke: #2563eb;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.temp-history-dot {
+  fill: #1e3a8a;
+  stroke: #fff;
+  stroke-width: 1;
+}
+
+.temp-history-axis-text {
+  fill: #64748b;
+  font-size: 11px;
+}
+
+.temp-history-hit {
+  cursor: crosshair;
+}
+
+.temp-history-crosshair {
+  stroke: #0f172a;
+  stroke-width: 1;
+}
+
+.temp-history-hover-dot {
+  fill: #1e3a8a;
+  stroke: #fff;
+  stroke-width: 1.5;
+}
+
+.temp-history-hover-temp {
+  fill: #0f172a;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  dominant-baseline: hanging;
+}
+
+.temp-history-time-bg {
+  fill: #fff;
+  stroke: #e2e8f0;
+  stroke-width: 1;
+}
+
+.temp-history-time-text {
+  fill: #0f172a;
+  font-size: 10px;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+}
+
+.temp-history-side {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1rem 1.5rem;
+}
+
+.temp-history-stats {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  overflow: hidden;
+  min-width: 7.5rem;
+}
+
+.temp-history-stat {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-rows: auto auto;
+  gap: 0 0.35rem;
+  padding: 0.55rem 0.65rem;
+  border-bottom: 1px solid #e2e8f0;
+  align-items: center;
+}
+
+.temp-history-stat:last-child {
+  border-bottom: none;
+}
+
+.temp-history-stat-label {
+  grid-row: 1 / span 2;
+  font-size: 1rem;
+  color: #64748b;
+  min-width: 1.25rem;
+  text-align: center;
+  justify-self: center;
+}
+
+.temp-history-stat-value {
+  grid-column: 2;
+  font-weight: 600;
+  font-size: 0.95rem;
+  color: #0f172a;
+}
+
+.temp-history-stat-caption {
+  grid-column: 2;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.temp-history-stat-avg {
+  background: #f8fafc;
+}
+
+.temp-history-current {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  min-width: 10rem;
+  max-width: 16rem;
+}
+
+.temp-history-current-heading {
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #64748b;
+  margin-bottom: 0.35rem;
+}
+
+.temp-history-current-when {
+  font-size: 0.72rem;
+  line-height: 1.35;
+  margin-bottom: 0.45rem;
+}
+
+.temp-history-current-value {
+  font-size: 1.75rem;
+  font-weight: 700;
+  color: #1e293b;
+  line-height: 1.1;
+  text-align: center;
+}

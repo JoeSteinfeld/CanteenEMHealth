@@ -16,6 +16,23 @@ type Row = {
 type SortKey = keyof Row | "action";
 type SortDir = "asc" | "desc";
 
+type TempHistoryPoint = { at: string; fahrenheit: number };
+type TempHistoryStats = {
+  maxF: number;
+  minF: number;
+  avgF: number;
+  latestF: number | null;
+  count: number;
+};
+type TempHistoryPayload = {
+  sensorId: string;
+  readingId: string;
+  startTime: string;
+  endTime: string;
+  points: TempHistoryPoint[];
+  stats: TempHistoryStats | null;
+};
+
 type HealthCategory = "never" | "stale" | "recentLow" | "recentOk";
 
 const HEALTH_CATEGORY_CONFIG: { key: HealthCategory; label: string; aria: string }[] = [
@@ -155,6 +172,355 @@ function SensorNoteField({
   );
 }
 
+function formatTempF(n: number): string {
+  return `${n.toFixed(1)}°F`;
+}
+
+/** Index of the sample whose time is closest to `t` (unix ms). Assumes `ts` sorted ascending. */
+function nearestIndexByTime(ts: number[], t: number): number {
+  const n = ts.length;
+  if (n === 0) return -1;
+  if (n === 1) return 0;
+  if (t <= ts[0]) return 0;
+  if (t >= ts[n - 1]) return n - 1;
+  let lo = 0;
+  let hi = n - 1;
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >> 1;
+    if (ts[mid] <= t) lo = mid;
+    else hi = mid;
+  }
+  return t - ts[lo] <= ts[hi] - t ? lo : hi;
+}
+
+function formatHoverDateTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const datePart = d.toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+  const timePart = d.toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+  });
+  return `${datePart} ${timePart}`;
+}
+
+function TemperatureHistoryChart({ points }: { points: TempHistoryPoint[] }) {
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+
+  const vbW = 690;
+  const vbH = 240;
+  const padL = 44;
+  const padR = 16;
+  /** Extra top inset so hover temperature (above crosshair) clears the grid */
+  const padT = 22;
+  const padB = 32;
+  const innerW = vbW - padL - padR;
+  const innerH = vbH - padT - padB;
+
+  if (points.length === 0) {
+    return (
+      <div className="temp-history-chart-empty muted">No temperature samples in this window.</div>
+    );
+  }
+
+  const ts = points.map((p) => new Date(p.at).getTime());
+  const fs = points.map((p) => p.fahrenheit);
+  let tMin = Math.min(...ts);
+  let tMax = Math.max(...ts);
+  let fMin = Math.min(...fs);
+  let fMax = Math.max(...fs);
+  if (tMax <= tMin) {
+    tMax = tMin + 1;
+  }
+  const fPad = Math.max((fMax - fMin) * 0.08, 1);
+  fMin -= fPad;
+  fMax += fPad;
+
+  const toX = (t: number) => padL + ((t - tMin) / (tMax - tMin)) * innerW;
+  const toY = (f: number) => padT + innerH - ((f - fMin) / (fMax - fMin)) * innerH;
+
+  const lineD = points
+    .map((p, i) => {
+      const x = toX(new Date(p.at).getTime());
+      const y = toY(p.fahrenheit);
+      return `${i === 0 ? "M" : "L"} ${x.toFixed(2)} ${y.toFixed(2)}`;
+    })
+    .join(" ");
+
+  const last = points[points.length - 1];
+  const lx = toX(new Date(last.at).getTime());
+  const ly = toY(last.fahrenheit);
+
+  const clientToSvg = (clientX: number, clientY: number): { x: number; y: number } | null => {
+    const el = svgRef.current;
+    if (!el) return null;
+    const pt = el.createSVGPoint();
+    pt.x = clientX;
+    pt.y = clientY;
+    const ctm = el.getScreenCTM();
+    if (!ctm) return null;
+    const p = pt.matrixTransform(ctm.inverse());
+    return { x: p.x, y: p.y };
+  };
+
+  const updateHoverFromEvent = (e: React.MouseEvent<SVGRectElement>) => {
+    const p = clientToSvg(e.clientX, e.clientY);
+    if (!p) return;
+    const { x: sx, y: sy } = p;
+    if (sx < padL || sx > padL + innerW || sy < padT || sy > padT + innerH) {
+      setHoverIdx(null);
+      return;
+    }
+    const tHover = tMin + ((sx - padL) / innerW) * (tMax - tMin);
+    setHoverIdx(nearestIndexByTime(ts, tHover));
+  };
+
+  const hi = hoverIdx != null && hoverIdx >= 0 && hoverIdx < points.length ? hoverIdx : null;
+  const hp = hi != null ? points[hi] : null;
+  const hx = hp ? toX(new Date(hp.at).getTime()) : 0;
+  const hy = hp ? toY(hp.fahrenheit) : 0;
+  const timeStr = hp ? formatHoverDateTime(hp.at) : "";
+  const timeBoxW = Math.min(innerW, Math.max(140, timeStr.length * 5.6 + 20));
+  const timeBoxX = Math.max(padL + 2, Math.min(hx - timeBoxW / 2, vbW - padR - timeBoxW - 2));
+  /** Top of viewBox, above plot (starts at padT); centered on crosshair — matches dashboard hover pattern */
+  const tempLabelY = 2;
+
+  const yTicks = 5;
+  const gridLines = [];
+  const yLabels = [];
+  for (let i = 0; i <= yTicks; i += 1) {
+    const f = fMin + (i / yTicks) * (fMax - fMin);
+    const y = toY(f);
+    gridLines.push(
+      <line
+        key={`h-${i}`}
+        x1={padL}
+        y1={y}
+        x2={padL + innerW}
+        y2={y}
+        className="temp-history-grid"
+      />,
+    );
+    yLabels.push(
+      <text key={`yl-${i}`} x={padL - 6} y={y + 4} className="temp-history-axis-text" textAnchor="end">
+        {Math.round(f)}
+      </text>,
+    );
+  }
+
+  const labelIdx = [0, Math.floor((points.length - 1) / 4), Math.floor((points.length - 1) / 2), Math.floor((3 * (points.length - 1)) / 4), points.length - 1].filter(
+    (i, j, a) => i >= 0 && a.indexOf(i) === j,
+  );
+  const xLabels = labelIdx.map((i) => {
+    const p = points[i];
+    const x = toX(new Date(p.at).getTime());
+    const d = new Date(p.at);
+    const txt =
+      d.getFullYear() === new Date().getFullYear()
+        ? d.toLocaleDateString("en-US", { month: "short", day: "numeric" })
+        : d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "2-digit" });
+    return (
+      <text key={`xl-${i}`} x={x} y={vbH - 8} className="temp-history-axis-text" textAnchor="middle">
+        {txt}
+      </text>
+    );
+  });
+
+  return (
+    <svg
+      ref={svgRef}
+      className="temp-history-chart"
+      viewBox={`0 0 ${vbW} ${vbH}`}
+      preserveAspectRatio="xMidYMid meet"
+      role="img"
+      aria-label="Temperature over the last 30 days. Hover the chart to read values."
+    >
+      {gridLines}
+      <path d={lineD} className="temp-history-line" fill="none" pointerEvents="none" />
+      {hoverIdx === null && <circle cx={lx} cy={ly} r={4} className="temp-history-dot" pointerEvents="none" />}
+      {yLabels}
+      {xLabels}
+      <rect
+        className="temp-history-hit"
+        x={padL}
+        y={padT}
+        width={innerW}
+        height={innerH}
+        fill="transparent"
+        pointerEvents="all"
+        onMouseMove={updateHoverFromEvent}
+        onMouseLeave={() => setHoverIdx(null)}
+      />
+      {hp != null && (
+        <g className="temp-history-hover" pointerEvents="none">
+          <line x1={hx} y1={padT} x2={hx} y2={padT + innerH} className="temp-history-crosshair" />
+          <circle cx={hx} cy={hy} r={5} className="temp-history-hover-dot" />
+          <text
+            x={hx}
+            y={tempLabelY}
+            className="temp-history-hover-temp"
+            textAnchor="middle"
+            dominantBaseline="hanging"
+          >
+            {formatTempF(hp.fahrenheit)}
+          </text>
+          <rect
+            x={timeBoxX}
+            y={vbH - 26}
+            width={timeBoxW}
+            height={20}
+            rx={3}
+            className="temp-history-time-bg"
+          />
+          <text x={timeBoxX + timeBoxW / 2} y={vbH - 11} className="temp-history-time-text" textAnchor="middle">
+            {timeStr}
+          </text>
+        </g>
+      )}
+    </svg>
+  );
+}
+
+function TemperatureHistoryModal({
+  open,
+  sensorId,
+  sensorName,
+  onClose,
+}: {
+  open: boolean;
+  sensorId: string | null;
+  sensorName: string;
+  onClose: () => void;
+}) {
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [data, setData] = useState<TempHistoryPayload | null>(null);
+
+  useEffect(() => {
+    if (!open || !sensorId) return;
+    let cancelled = false;
+    setLoading(true);
+    setErr(null);
+    setData(null);
+    void (async () => {
+      try {
+        const r = await fetch(`/api/sensor-temperature-history?sensorId=${encodeURIComponent(sensorId)}`);
+        const j = (await parseJsonSafe(r)) as Record<string, unknown>;
+        if (!r.ok) {
+          const msg = [j.error, j.hint].filter(Boolean).join(" — ");
+          throw new Error(msg || r.statusText);
+        }
+        if (!cancelled) setData(j as unknown as TempHistoryPayload);
+      } catch (e) {
+        if (!cancelled) setErr(e instanceof Error ? e.message : "Failed to load history");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, sensorId]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  const titleId = "temp-history-modal-title";
+  const st = data?.stats;
+
+  return (
+    <div
+      className="temp-history-overlay"
+      role="presentation"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        className="temp-history-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div className="temp-history-head">
+          <div>
+            <h2 id={titleId} className="temp-history-title">
+              Temperature history
+            </h2>
+            <p className="temp-history-sub muted">
+              {sensorName || "—"} <span className="mono">({sensorId})</span> · last 30 days ·{" "}
+              <code>GET /readings/history</code>
+            </p>
+          </div>
+          <button type="button" className="temp-history-close" onClick={onClose} aria-label="Close">
+            ×
+          </button>
+        </div>
+
+        {loading && <p className="temp-history-status muted">Loading history…</p>}
+        {err && !loading && <div className="banner err temp-history-err">{err}</div>}
+
+        {!loading && !err && data && (
+          <div className="temp-history-body">
+            <div className="temp-history-chart-wrap">
+              <TemperatureHistoryChart points={data.points} />
+            </div>
+            <div className="temp-history-side">
+              <div className="temp-history-stats">
+                <div className="temp-history-stat">
+                  <span className="temp-history-stat-label" aria-hidden>
+                    ↑
+                  </span>
+                  <span className="temp-history-stat-value">{st ? formatTempF(st.maxF) : "—"}</span>
+                  <span className="temp-history-stat-caption muted">Max</span>
+                </div>
+                <div className="temp-history-stat temp-history-stat-avg">
+                  <span className="temp-history-stat-label" aria-hidden>
+                    ·
+                  </span>
+                  <span className="temp-history-stat-value">{st ? formatTempF(st.avgF) : "—"}</span>
+                  <span className="temp-history-stat-caption muted">Avg</span>
+                </div>
+                <div className="temp-history-stat">
+                  <span className="temp-history-stat-label" aria-hidden>
+                    ↓
+                  </span>
+                  <span className="temp-history-stat-value">{st ? formatTempF(st.minF) : "—"}</span>
+                  <span className="temp-history-stat-caption muted">Min</span>
+                </div>
+              </div>
+              <div className="temp-history-current">
+                <span className="temp-history-current-heading">Latest</span>
+                <span className="temp-history-current-when muted">
+                  {data.points.length > 0
+                    ? formatHoverDateTime(data.points[data.points.length - 1].at)
+                    : "—"}
+                </span>
+                <span className="temp-history-current-value">{st?.latestF != null ? formatTempF(st.latestF) : "—"}</span>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [tags, setTags] = useState<Tag[]>([]);
   const [selectedTagIds, setSelectedTagIds] = useState<Set<string>>(new Set());
@@ -176,6 +542,8 @@ export default function App() {
   const [columnSearch, setColumnSearch] = useState<Record<TableColumnKey, string>>(emptyColumnSearch());
   /** From GET /api/org-id → Samsara GET /me; used for cloud deep links on sensor names. */
   const [samsaraOrgId, setSamsaraOrgId] = useState<string | null>(null);
+  /** Row for which the temperature history modal is open (on-demand /readings/history). */
+  const [tempHistoryRow, setTempHistoryRow] = useState<{ id: string; name: string } | null>(null);
 
   const loadTags = useCallback(async () => {
     setLoadingTags(true);
@@ -417,7 +785,8 @@ export default function App() {
           Sensors come from each tag’s <code>sensors</code> list on <strong>List tags</strong> (
           <code>GET /tags</code>). Readings use the <strong>Get Readings Snapshot</strong> API (
           <code>GET /readings/latest</code> with <code>entityType=sensor</code>) for widget and environmental
-          monitor fields.
+          monitor fields. Click a <strong>temperature</strong> value to load a 30-day chart from{" "}
+          <code>GET /readings/history</code> for that sensor only.
         </p>
       </header>
 
@@ -763,7 +1132,16 @@ export default function App() {
                     </td>
                     <td>{r.batteryVoltageLow}</td>
                     <td className="mono">{r.batteryVoltage}</td>
-                    <td className="mono">{r.temperature}</td>
+                    <td className="mono">
+                      <button
+                        type="button"
+                        className="linkish temp-history-btn"
+                        onClick={() => setTempHistoryRow({ id: r.id, name: r.name })}
+                        title="Open 30-day temperature history for this sensor"
+                      >
+                        {r.temperature}
+                      </button>
+                    </td>
                     <td>{action || "—"}</td>
                     <td className="notes-cell">
                       <SensorNoteField sensorId={r.id} value={r.note} onPersisted={handleNotePersisted} />
@@ -775,6 +1153,13 @@ export default function App() {
           </table>
         </div>
       </section>
+
+      <TemperatureHistoryModal
+        open={tempHistoryRow != null}
+        sensorId={tempHistoryRow?.id ?? null}
+        sensorName={tempHistoryRow?.name ?? ""}
+        onClose={() => setTempHistoryRow(null)}
+      />
     </div>
   );
 }

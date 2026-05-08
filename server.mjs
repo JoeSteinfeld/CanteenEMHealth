@@ -19,7 +19,13 @@ const READING_IDS = [
   "environmentMonitorAmbientTemperatureBLEConnection",
 ].join(",");
 
+/** Single reading for GET /readings/history (query uses `readingId`, not `readingIds`). */
+const TEMP_BLE_READING_ID = "environmentMonitorAmbientTemperatureBLEConnection";
+
 const ENTITY_BATCH = 50;
+
+/** Guard very deep pagination for one-sensor history (30 days). */
+const READINGS_HISTORY_MAX_PAGES = 500;
 
 const NOTES_DB_PATH = process.env.NOTES_DB_PATH ?? join(process.cwd(), "data", "sensor-notes.sqlite");
 const notesStore = openSensorNotesDb(NOTES_DB_PATH);
@@ -145,6 +151,29 @@ async function paginateReadingsSnapshot(params) {
     const p = new URLSearchParams(params);
     if (after) p.set("after", after);
     const data = await samsaraFetch("/readings/latest", p);
+    out.push(...extractListData(data));
+    const hasNext = data.pagination?.hasNextPage;
+    if (hasNext === false) break;
+    if (hasNext == null) break;
+    const end = data.pagination?.endCursor;
+    if (end == null || end === "") break;
+    const next = String(end);
+    if (next === after) break;
+    after = next;
+  }
+  return out;
+}
+
+async function paginateReadingsHistory(params) {
+  const out = [];
+  let after = null;
+  let pages = 0;
+  for (;;) {
+    pages += 1;
+    if (pages > READINGS_HISTORY_MAX_PAGES) break;
+    const p = new URLSearchParams(params);
+    if (after) p.set("after", after);
+    const data = await samsaraFetch("/readings/history", p);
     out.push(...extractListData(data));
     const hasNext = data.pagination?.hasNextPage;
     if (hasNext === false) break;
@@ -356,6 +385,82 @@ app.get("/api/sensor-records", async (req, res) => {
   }
 });
 
+/**
+ * On-demand 30-day ambient temperature history for one sensor (GET /readings/history).
+ * Does not run during /api/sensor-records — only when the UI opens the temperature chart.
+ */
+app.get("/api/sensor-temperature-history", async (req, res) => {
+  if (!requireToken(res)) return;
+  const rawId = req.query.sensorId != null ? String(req.query.sensorId).trim() : "";
+  if (!rawId || !/^[\w-]{1,128}$/.test(rawId)) {
+    res.status(400).json({ error: "Missing or invalid sensorId query parameter" });
+    return;
+  }
+
+  const endMs = Date.now();
+  const startMs = endMs - 30 * 24 * 60 * 60 * 1000;
+  const endTime = new Date(endMs).toISOString();
+  const startTime = new Date(startMs).toISOString();
+
+  const params = new URLSearchParams();
+  params.set("entityType", READINGS_ENTITY_TYPE);
+  params.set("entityIds", rawId);
+  params.set("readingId", TEMP_BLE_READING_ID);
+  params.set("startTime", startTime);
+  params.set("endTime", endTime);
+
+  try {
+    const rows = await paginateReadingsHistory(params);
+    const points = [];
+    for (const row of rows) {
+      if (!row || row.entityId == null) continue;
+      if (String(row.entityId) !== rawId) continue;
+      const at = row.happenedAtTime != null ? String(row.happenedAtTime) : "";
+      if (!at) continue;
+      const f = readingCelsiusToFahrenheit(row.value);
+      if (f == null) continue;
+      points.push({ at, fahrenheit: f });
+    }
+    points.sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
+
+    let maxF = -Infinity;
+    let minF = Infinity;
+    let sum = 0;
+    let n = 0;
+    for (const p of points) {
+      maxF = Math.max(maxF, p.fahrenheit);
+      minF = Math.min(minF, p.fahrenheit);
+      sum += p.fahrenheit;
+      n += 1;
+    }
+    const latestF = n > 0 ? points[n - 1].fahrenheit : null;
+
+    res.json({
+      sensorId: rawId,
+      readingId: TEMP_BLE_READING_ID,
+      startTime,
+      endTime,
+      points,
+      stats:
+        n > 0
+          ? {
+              maxF,
+              minF,
+              avgF: sum / n,
+              latestF,
+              count: n,
+            }
+          : null,
+    });
+  } catch (e) {
+    res.status(e.status || 500).json({
+      error: e.message,
+      details: e.body,
+      hint: "Requires Read Readings scope and GET /readings/history access. SAMSARA_READINGS_ENTITY_TYPE must match your sensors (default sensor).",
+    });
+  }
+});
+
 app.put("/api/sensor-notes/:sensorId", (req, res) => {
   try {
     const sensorId = req.params.sensorId != null ? String(req.params.sensorId).trim() : "";
@@ -397,6 +502,13 @@ function formatReadingValue(readingId, value) {
   } catch {
     return "—";
   }
+}
+
+/** Numeric °F from a history `value` object (Samsara reports °C for this reading). */
+function readingCelsiusToFahrenheit(value) {
+  const v = unwrapValue(value);
+  if (typeof v !== "number" || !Number.isFinite(v)) return null;
+  return (v * 9) / 5 + 32;
 }
 
 function unwrapValue(value) {
