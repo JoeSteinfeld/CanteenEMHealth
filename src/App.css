@@ -656,6 +656,27 @@ button.temp-history-btn {
   color: #0f172a;
 }
 
+.temp-history-legend {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  margin: 0.4rem 0 0;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  color: #475569;
+  max-width: 42rem;
+}
+
+.temp-history-legend-swatch {
+  flex-shrink: 0;
+  width: 0.85rem;
+  height: 0.85rem;
+  margin-top: 0.15rem;
+  border-radius: 2px;
+  background: rgba(34, 197, 94, 0.28);
+  border: 1px solid rgba(22, 163, 74, 0.35);
+}
+
 .temp-history-sub {
   margin: 0.25rem 0 0;
   font-size: 0.82rem;
@@ -723,6 +744,10 @@ button.temp-history-close:hover {
   border: 1px dashed #cbd5e1;
   border-radius: 8px;
   font-size: 0.9rem;
+}
+
+.temp-history-acceptable-band {
+  fill: rgba(34, 197, 94, 0.22);
 }
 
 .temp-history-grid {

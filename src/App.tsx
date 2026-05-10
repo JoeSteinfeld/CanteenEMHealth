@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import "./App.css";
 
 type Tag = { id: string | number; name: string };
@@ -209,7 +209,18 @@ function formatHoverDateTime(iso: string): string {
   return `${datePart} ${timePart}`;
 }
 
-function TemperatureHistoryChart({ points }: { points: TempHistoryPoint[] }) {
+/**
+ * Acceptable °F bands by sensor name (case-insensitive). Freezer checked before Cooler.
+ * Spec: Freezer &gt; −25 and &lt; 25; Cooler &gt; 32 and &lt; 50 — band drawn on [lo, hi] for visibility.
+ */
+function acceptableTempRangeForSensorName(sensorName: string): { lo: number; hi: number; kind: "freezer" | "cooler" } | null {
+  const n = sensorName.trim().toLowerCase();
+  if (n.includes("freezer")) return { lo: -25, hi: 25, kind: "freezer" };
+  if (n.includes("cooler")) return { lo: 32, hi: 50, kind: "cooler" };
+  return null;
+}
+
+function TemperatureHistoryChart({ points, sensorName }: { points: TempHistoryPoint[]; sensorName: string }) {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
 
@@ -229,6 +240,8 @@ function TemperatureHistoryChart({ points }: { points: TempHistoryPoint[] }) {
     );
   }
 
+  const acceptableRange = acceptableTempRangeForSensorName(sensorName);
+
   const ts = points.map((p) => new Date(p.at).getTime());
   const fs = points.map((p) => p.fahrenheit);
   let tMin = Math.min(...ts);
@@ -237,6 +250,10 @@ function TemperatureHistoryChart({ points }: { points: TempHistoryPoint[] }) {
   let fMax = Math.max(...fs);
   if (tMax <= tMin) {
     tMax = tMin + 1;
+  }
+  if (acceptableRange) {
+    fMin = Math.min(fMin, acceptableRange.lo);
+    fMax = Math.max(fMax, acceptableRange.hi);
   }
   const fPad = Math.max((fMax - fMin) * 0.08, 1);
   fMin -= fPad;
@@ -314,6 +331,27 @@ function TemperatureHistoryChart({ points }: { points: TempHistoryPoint[] }) {
     );
   }
 
+  let acceptableBandEl: ReactNode = null;
+  if (acceptableRange) {
+    const { lo, hi } = acceptableRange;
+    const yHi = toY(hi);
+    const yLo = toY(lo);
+    const bandTop = Math.min(yHi, yLo);
+    const bandH = Math.abs(yLo - yHi);
+    if (bandH > 0.5) {
+      acceptableBandEl = (
+        <rect
+          className="temp-history-acceptable-band"
+          x={padL}
+          y={bandTop}
+          width={innerW}
+          height={bandH}
+          pointerEvents="none"
+        />
+      );
+    }
+  }
+
   const labelIdx = [0, Math.floor((points.length - 1) / 4), Math.floor((points.length - 1) / 2), Math.floor((3 * (points.length - 1)) / 4), points.length - 1].filter(
     (i, j, a) => i >= 0 && a.indexOf(i) === j,
   );
@@ -339,9 +377,14 @@ function TemperatureHistoryChart({ points }: { points: TempHistoryPoint[] }) {
       viewBox={`0 0 ${vbW} ${vbH}`}
       preserveAspectRatio="xMidYMid meet"
       role="img"
-      aria-label="Temperature over the last 30 days. Hover the chart to read values."
+      aria-label={
+        acceptableRange
+          ? `Temperature over the last 30 days. Acceptable range ${acceptableRange.lo}°F to ${acceptableRange.hi}°F shown in green. Hover the chart to read values.`
+          : "Temperature over the last 30 days. Hover the chart to read values."
+      }
     >
       {gridLines}
+      {acceptableBandEl}
       <path d={lineD} className="temp-history-line" fill="none" pointerEvents="none" />
       {hoverIdx === null && <circle cx={lx} cy={ly} r={4} className="temp-history-dot" pointerEvents="none" />}
       {yLabels}
@@ -462,6 +505,13 @@ function TemperatureHistoryModal({
             <h2 id={titleId} className="temp-history-title">
               Temperature history
             </h2>
+            <p className="temp-history-legend" role="note">
+              <span className="temp-history-legend-swatch" aria-hidden />
+              <span>
+                Green band = acceptable range by name: <strong>Freezer</strong> (−25°F to 25°F) ·{" "}
+                <strong>Cooler</strong> (32°F to 50°F).
+              </span>
+            </p>
             <p className="temp-history-sub muted">
               {sensorName || "—"} <span className="mono">({sensorId})</span> · last 30 days ·{" "}
               <code>GET /readings/history</code>
@@ -478,7 +528,7 @@ function TemperatureHistoryModal({
         {!loading && !err && data && (
           <div className="temp-history-body">
             <div className="temp-history-chart-wrap">
-              <TemperatureHistoryChart points={data.points} />
+              <TemperatureHistoryChart points={data.points} sensorName={sensorName} />
             </div>
             <div className="temp-history-side">
               <div className="temp-history-stats">
