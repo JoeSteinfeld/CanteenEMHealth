@@ -28,33 +28,49 @@ function signPayload(payload) {
   return `${body}.${sig}`;
 }
 
-export function createSessionToken() {
+export function createSessionToken(username) {
   const now = Date.now();
-  return signPayload({ iat: now, exp: now + SESSION_MAX_AGE_MS });
+  const sub = String(username ?? USERNAME).trim() || USERNAME;
+  return signPayload({ sub, iat: now, exp: now + SESSION_MAX_AGE_MS });
 }
 
-export function verifySessionToken(token) {
-  if (!token || typeof token !== "string") return false;
+/** @returns {{ sub?: string; iat: number; exp: number } | null} */
+export function getSessionPayload(token) {
+  if (!token || typeof token !== "string") return null;
   const dot = token.lastIndexOf(".");
-  if (dot <= 0) return false;
+  if (dot <= 0) return null;
   const body = token.slice(0, dot);
   const sig = token.slice(dot + 1);
   const expected = crypto.createHmac("sha256", authSecret()).update(body).digest("base64url");
   try {
     const a = Buffer.from(sig, "base64url");
     const b = Buffer.from(expected, "base64url");
-    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
   } catch {
-    return false;
+    return null;
   }
   let payload;
   try {
     payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
   } catch {
-    return false;
+    return null;
   }
-  if (typeof payload.exp !== "number" || Date.now() > payload.exp) return false;
-  return true;
+  if (typeof payload.exp !== "number" || Date.now() > payload.exp) return null;
+  return payload;
+}
+
+export function verifySessionToken(token) {
+  return getSessionPayload(token) != null;
+}
+
+/** @returns {{ username: string } | null} */
+export function getSession(req) {
+  const token = parseCookies(req)[SESSION_COOKIE];
+  const payload = getSessionPayload(token);
+  if (!payload) return null;
+  const username =
+    typeof payload.sub === "string" && payload.sub.trim() ? payload.sub.trim() : USERNAME;
+  return { username };
 }
 
 export function parseCookies(req) {

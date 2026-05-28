@@ -2,9 +2,11 @@ import "dotenv/config";
 import cors from "cors";
 import express from "express";
 import { join } from "node:path";
+import { getClientIp, getUserAgent, openAuditDb } from "./audit-db.mjs";
 import {
   clearSessionCookie,
   createSessionToken,
+  getSession,
   isAuthEnabled,
   isAuthenticated,
   protectApiRoutes,
@@ -37,7 +39,18 @@ const ENTITY_BATCH = 50;
 const READINGS_HISTORY_MAX_PAGES = 500;
 
 const NOTES_DB_PATH = process.env.NOTES_DB_PATH ?? join(process.cwd(), "data", "sensor-notes.sqlite");
+const AUDIT_DB_PATH = process.env.AUDIT_DB_PATH ?? join(process.cwd(), "data", "access-audit.sqlite");
 const notesStore = openSensorNotesDb(NOTES_DB_PATH);
+const auditLog = openAuditDb(AUDIT_DB_PATH);
+
+function auditFromRequest(req, event, username = null) {
+  auditLog.record({
+    event,
+    username,
+    ip: getClientIp(req),
+    userAgent: getUserAgent(req),
+  });
+}
 
 function messageFromSamsaraBody(body, fallback) {
   if (!body || typeof body !== "object" || "raw" in body) return fallback;
@@ -258,22 +271,38 @@ app.post("/api/auth/login", (req, res) => {
   const username = req.body?.username != null ? String(req.body.username) : "";
   const password = req.body?.password != null ? String(req.body.password) : "";
   if (!validateCredentials(username, password)) {
+    auditFromRequest(req, "login_failed", username || null);
     res.status(401).json({ error: "Invalid username or password" });
     return;
   }
-  setSessionCookie(res, createSessionToken());
+  setSessionCookie(res, createSessionToken(username));
+  auditFromRequest(req, "login_success", username);
   res.json({ ok: true, authRequired: true });
 });
 
-app.post("/api/auth/logout", (_req, res) => {
+app.post("/api/auth/logout", (req, res) => {
+  const session = getSession(req);
+  auditFromRequest(req, "logout", session?.username ?? null);
   clearSessionCookie(res);
   res.json({ ok: true });
 });
 
 app.get("/api/auth/session", (req, res) => {
+  const authenticated = isAuthenticated(req);
+  const authRequired = isAuthEnabled();
+  if (authenticated && authRequired) {
+    const session = getSession(req);
+    if (session) {
+      auditLog.recordSiteAccess({
+        username: session.username,
+        ip: getClientIp(req),
+        userAgent: getUserAgent(req),
+      });
+    }
+  }
   res.json({
-    authenticated: isAuthenticated(req),
-    authRequired: isAuthEnabled(),
+    authenticated,
+    authRequired,
   });
 });
 
@@ -284,6 +313,7 @@ app.get("/api/health", (_req, res) => {
     base: BASE,
     samsaraPathStyle: DEFAULT_PATH_STYLE,
     notesDbPath: NOTES_DB_PATH,
+    auditDbPath: AUDIT_DB_PATH,
   });
 });
 
@@ -565,6 +595,7 @@ function unwrapValue(value) {
 const server = app.listen(PORT, () => {
   console.log(`Samsara proxy on http://127.0.0.1:${PORT} → ${BASE}`);
   console.log(`Sensor notes DB: ${NOTES_DB_PATH}`);
+  console.log(`Access audit DB: ${AUDIT_DB_PATH}`);
   if (isAuthEnabled()) {
     console.log("Site login: enabled (SITE_PASSWORD is set)");
   } else {
