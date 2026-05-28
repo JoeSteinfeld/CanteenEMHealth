@@ -6,6 +6,92 @@
   padding: 1.5rem 1.25rem 3rem;
 }
 
+.auth-screen {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+}
+
+.login-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+}
+
+.login-card {
+  width: 100%;
+  max-width: 24rem;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 1.75rem 1.5rem 1.5rem;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+
+.login-header h1 {
+  margin: 0 0 0.35rem;
+  font-size: 1.35rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.login-lede {
+  margin: 0 0 1.25rem;
+  color: #64748b;
+  font-size: 0.9rem;
+}
+
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+.login-field input {
+  width: 100%;
+  margin-top: 0.25rem;
+  padding: 0.5rem 0.65rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.login-field input:focus {
+  outline: 2px solid #93c5fd;
+  outline-offset: 1px;
+  border-color: #3b82f6;
+}
+
+.login-error {
+  margin: 0;
+}
+
+.login-submit {
+  width: 100%;
+  margin-top: 0.25rem;
+}
+
+.header-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.5rem;
+}
+
+.header-top h1 {
+  margin: 0;
+}
+
+.header-sign-out {
+  flex-shrink: 0;
+  margin-top: 0.15rem;
+}
+
 .header h1 {
   margin: 0 0 0.5rem;
   font-size: 1.5rem;
@@ -714,6 +800,73 @@ button.temp-history-close:hover {
 
 .temp-history-err {
   margin-top: 0.5rem;
+}
+
+.temp-history-daily-window {
+  margin-top: 0.5rem;
+  padding: 0.65rem 0.75rem;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+}
+
+.temp-history-daily-window-title {
+  display: block;
+  font-weight: 600;
+  font-size: 0.82rem;
+  color: #0f172a;
+  margin-bottom: 0.2rem;
+}
+
+.temp-history-daily-window-hint {
+  display: block;
+  font-size: 0.75rem;
+  line-height: 1.35;
+  margin-bottom: 0.5rem;
+}
+
+.temp-history-daily-window-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.65rem 1rem;
+}
+
+.temp-history-time-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.8rem;
+  color: #334155;
+}
+
+.temp-history-time-field-label {
+  font-weight: 500;
+}
+
+.temp-history-time-field input[type="time"] {
+  padding: 0.3rem 0.45rem;
+  font: inherit;
+  font-size: 0.88rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #fff;
+  color: #0f172a;
+}
+
+.temp-history-time-field input[type="time"]:focus {
+  outline: 2px solid #3b82f6;
+  outline-offset: 1px;
+}
+
+button.temp-history-daily-clear {
+  margin-bottom: 0.15rem;
+  align-self: flex-end;
+}
+
+.temp-history-filter-empty {
+  margin: 0.5rem 0 0;
+  font-size: 0.85rem;
 }
 
 .temp-history-body {

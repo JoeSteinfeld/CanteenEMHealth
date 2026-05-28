@@ -2,6 +2,15 @@ import "dotenv/config";
 import cors from "cors";
 import express from "express";
 import { join } from "node:path";
+import {
+  clearSessionCookie,
+  createSessionToken,
+  isAuthEnabled,
+  isAuthenticated,
+  protectApiRoutes,
+  setSessionCookie,
+  validateCredentials,
+} from "./auth.mjs";
 import { MAX_NOTE_LENGTH, openSensorNotesDb } from "./notes-db.mjs";
 
 const PORT = Number(process.env.PORT ?? 3001);
@@ -232,8 +241,41 @@ function collectSensorsFromTagRows(tagRows, filterTagIds) {
 }
 
 const app = express();
-app.use(cors());
+app.use(
+  cors({
+    origin: true,
+    credentials: true,
+  }),
+);
 app.use(express.json());
+app.use(protectApiRoutes);
+
+app.post("/api/auth/login", (req, res) => {
+  if (!isAuthEnabled()) {
+    res.json({ ok: true, authRequired: false });
+    return;
+  }
+  const username = req.body?.username != null ? String(req.body.username) : "";
+  const password = req.body?.password != null ? String(req.body.password) : "";
+  if (!validateCredentials(username, password)) {
+    res.status(401).json({ error: "Invalid username or password" });
+    return;
+  }
+  setSessionCookie(res, createSessionToken());
+  res.json({ ok: true, authRequired: true });
+});
+
+app.post("/api/auth/logout", (_req, res) => {
+  clearSessionCookie(res);
+  res.json({ ok: true });
+});
+
+app.get("/api/auth/session", (req, res) => {
+  res.json({
+    authenticated: isAuthenticated(req),
+    authRequired: isAuthEnabled(),
+  });
+});
 
 app.get("/api/health", (_req, res) => {
   res.json({
@@ -520,8 +562,25 @@ function unwrapValue(value) {
   return value;
 }
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Samsara proxy on http://127.0.0.1:${PORT} → ${BASE}`);
   console.log(`Sensor notes DB: ${NOTES_DB_PATH}`);
+  if (isAuthEnabled()) {
+    console.log("Site login: enabled (SITE_PASSWORD is set)");
+  } else {
+    console.warn("Site login: disabled. Set SITE_PASSWORD in .env to require sign-in.\n");
+  }
   if (!TOKEN) console.warn("SAMSARA_API_TOKEN is not set. Add it to .env to load data.\n");
+});
+
+server.on("error", (err) => {
+  if (err && "code" in err && err.code === "EADDRINUSE") {
+    console.error(
+      `\nPort ${PORT} is already in use. Stop the other process or set PORT in .env.\n` +
+        `  lsof -i :${PORT}\n` +
+        `  kill <pid>\n`,
+    );
+    process.exit(1);
+  }
+  throw err;
 });

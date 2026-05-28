@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { apiFetch, fetchSession, logout, type SessionInfo } from "./auth";
+import { Login } from "./Login";
 import "./App.css";
 
 type Tag = { id: string | number; name: string };
@@ -114,7 +116,7 @@ function SensorNoteField({
   const persist = useCallback(
     async (note: string) => {
       try {
-        const res = await fetch(`/api/sensor-notes/${encodeURIComponent(sensorId)}`, {
+        const res = await apiFetch(`/api/sensor-notes/${encodeURIComponent(sensorId)}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ note }),
@@ -220,9 +222,87 @@ function acceptableTempRangeForSensorName(sensorName: string): { lo: number; hi:
   return null;
 }
 
-function TemperatureHistoryChart({ points, sensorName }: { points: TempHistoryPoint[]; sensorName: string }) {
+/** Parse `<input type="time">` value (`HH:MM` or `HH:MM:SS`) to minutes since midnight. */
+function parseTimeInputToMinutes(t: string): number | null {
+  const s = t.trim();
+  if (!s) return null;
+  const [hStr, mStr] = s.split(":");
+  const h = parseInt(hStr, 10);
+  const m = parseInt(mStr ?? "", 10);
+  if (!Number.isFinite(h) || !Number.isFinite(m) || h < 0 || h > 23 || m < 0 || m > 59) return null;
+  return h * 60 + m;
+}
+
+function localMinuteOfDayFromIso(iso: string): number {
+  const d = new Date(iso);
+  return d.getHours() * 60 + d.getMinutes();
+}
+
+/** Inclusive daily window in local time. Equal start/end ⇒ treat as full day. Overnight if start &gt; end. */
+function isMinuteInDailyWindow(minute: number, startMin: number, endMin: number): boolean {
+  if (startMin === endMin) return true;
+  if (startMin < endMin) return minute >= startMin && minute <= endMin;
+  return minute >= startMin || minute <= endMin;
+}
+
+function filterPointsByDailyWindow(points: TempHistoryPoint[], startTime: string, endTime: string): TempHistoryPoint[] {
+  const startMin = parseTimeInputToMinutes(startTime);
+  const endMin = parseTimeInputToMinutes(endTime);
+  if (startMin == null || endMin == null) return points;
+  return points.filter((p) => isMinuteInDailyWindow(localMinuteOfDayFromIso(p.at), startMin, endMin));
+}
+
+/** Centered moving average on °F; keeps each sample’s timestamp (for hover / x-axis). */
+function smoothMovingAverage(points: TempHistoryPoint[], radius: number): TempHistoryPoint[] {
+  if (points.length === 0 || radius < 1) return points;
+  const out: TempHistoryPoint[] = [];
+  for (let i = 0; i < points.length; i++) {
+    let sum = 0;
+    let c = 0;
+    for (let j = Math.max(0, i - radius); j <= Math.min(points.length - 1, i + radius); j++) {
+      sum += points[j].fahrenheit;
+      c += 1;
+    }
+    out.push({ at: points[i].at, fahrenheit: sum / c });
+  }
+  return out;
+}
+
+function statsFromPoints(points: TempHistoryPoint[]): TempHistoryStats | null {
+  if (points.length === 0) return null;
+  let maxF = -Infinity;
+  let minF = Infinity;
+  let sum = 0;
+  for (const p of points) {
+    maxF = Math.max(maxF, p.fahrenheit);
+    minF = Math.min(minF, p.fahrenheit);
+    sum += p.fahrenheit;
+  }
+  const n = points.length;
+  return {
+    maxF,
+    minF,
+    avgF: sum / n,
+    latestF: points[n - 1].fahrenheit,
+    count: n,
+  };
+}
+
+function TemperatureHistoryChart({
+  points,
+  sensorName,
+  dailyWindowActive = false,
+}: {
+  points: TempHistoryPoint[];
+  sensorName: string;
+  dailyWindowActive?: boolean;
+}) {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+
+  useEffect(() => {
+    setHoverIdx(null);
+  }, [points]);
 
   const vbW = 690;
   const vbH = 240;
@@ -377,11 +457,15 @@ function TemperatureHistoryChart({ points, sensorName }: { points: TempHistoryPo
       viewBox={`0 0 ${vbW} ${vbH}`}
       preserveAspectRatio="xMidYMid meet"
       role="img"
-      aria-label={
+      aria-label={[
         acceptableRange
-          ? `Temperature over the last 30 days. Acceptable range ${acceptableRange.lo}°F to ${acceptableRange.hi}°F shown in green. Hover the chart to read values.`
-          : "Temperature over the last 30 days. Hover the chart to read values."
-      }
+          ? `Temperature over the last 30 days. Acceptable range ${acceptableRange.lo}°F to ${acceptableRange.hi}°F shown in green.`
+          : "Temperature over the last 30 days.",
+        dailyWindowActive ? "Filtered to a daily local time window with smoothed values." : "",
+        "Hover the chart to read values.",
+      ]
+        .filter(Boolean)
+        .join(" ")}
     >
       {gridLines}
       {acceptableBandEl}
@@ -444,6 +528,16 @@ function TemperatureHistoryModal({
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [data, setData] = useState<TempHistoryPayload | null>(null);
+  /** Local `<input type="time">` values; both set ⇒ filter each day to this window and smooth the series */
+  const [dailyTimeStart, setDailyTimeStart] = useState("");
+  const [dailyTimeEnd, setDailyTimeEnd] = useState("");
+
+  useEffect(() => {
+    if (!open) {
+      setDailyTimeStart("");
+      setDailyTimeEnd("");
+    }
+  }, [open]);
 
   useEffect(() => {
     if (!open || !sensorId) return;
@@ -453,7 +547,7 @@ function TemperatureHistoryModal({
     setData(null);
     void (async () => {
       try {
-        const r = await fetch(`/api/sensor-temperature-history?sensorId=${encodeURIComponent(sensorId)}`);
+        const r = await apiFetch(`/api/sensor-temperature-history?sensorId=${encodeURIComponent(sensorId)}`);
         const j = (await parseJsonSafe(r)) as Record<string, unknown>;
         if (!r.ok) {
           const msg = [j.error, j.hint].filter(Boolean).join(" — ");
@@ -480,10 +574,23 @@ function TemperatureHistoryModal({
     return () => document.removeEventListener("keydown", onKey);
   }, [open, onClose]);
 
+  const chartPoints = useMemo(() => {
+    if (!data?.points?.length) return [];
+    const hasWindow = dailyTimeStart.trim() !== "" && dailyTimeEnd.trim() !== "";
+    if (!hasWindow) return data.points;
+    let p = filterPointsByDailyWindow(data.points, dailyTimeStart, dailyTimeEnd);
+    if (p.length >= 2) {
+      p = smoothMovingAverage(p, 2);
+    }
+    return p;
+  }, [data, dailyTimeStart, dailyTimeEnd]);
+
+  const displayStats = useMemo(() => statsFromPoints(chartPoints), [chartPoints]);
+  const dailyWindowActive = dailyTimeStart.trim() !== "" && dailyTimeEnd.trim() !== "";
+
   if (!open) return null;
 
   const titleId = "temp-history-modal-title";
-  const st = data?.stats;
 
   return (
     <div
@@ -526,45 +633,101 @@ function TemperatureHistoryModal({
         {err && !loading && <div className="banner err temp-history-err">{err}</div>}
 
         {!loading && !err && data && (
-          <div className="temp-history-body">
-            <div className="temp-history-chart-wrap">
-              <TemperatureHistoryChart points={data.points} sensorName={sensorName} />
+          <>
+            <div className="temp-history-daily-window">
+              <span className="temp-history-daily-window-title">Daily time window</span>
+              <span className="temp-history-daily-window-hint muted">
+                Local time each day. Set both to filter points and smooth the line; overnight OK (e.g. 22:00–06:00).
+              </span>
+              <div className="temp-history-daily-window-row">
+                <label className="temp-history-time-field">
+                  <span className="temp-history-time-field-label">Start</span>
+                  <input
+                    type="time"
+                    value={dailyTimeStart}
+                    onChange={(e) => setDailyTimeStart(e.target.value)}
+                    aria-label="Daily window start time"
+                  />
+                </label>
+                <label className="temp-history-time-field">
+                  <span className="temp-history-time-field-label">End</span>
+                  <input
+                    type="time"
+                    value={dailyTimeEnd}
+                    onChange={(e) => setDailyTimeEnd(e.target.value)}
+                    aria-label="Daily window end time"
+                  />
+                </label>
+                <button
+                  type="button"
+                  className="linkish temp-history-daily-clear"
+                  onClick={() => {
+                    setDailyTimeStart("");
+                    setDailyTimeEnd("");
+                  }}
+                  disabled={!dailyTimeStart && !dailyTimeEnd}
+                >
+                  Clear times
+                </button>
+              </div>
             </div>
-            <div className="temp-history-side">
-              <div className="temp-history-stats">
-                <div className="temp-history-stat">
-                  <span className="temp-history-stat-label" aria-hidden>
-                    ↑
-                  </span>
-                  <span className="temp-history-stat-value">{st ? formatTempF(st.maxF) : "—"}</span>
-                  <span className="temp-history-stat-caption muted">Max</span>
+            {dailyWindowActive && data.points.length > 0 && chartPoints.length === 0 && (
+              <p className="temp-history-filter-empty muted">
+                No samples fall in this daily window. Try a wider range or clear times.
+              </p>
+            )}
+            <div className="temp-history-body">
+              <div className="temp-history-chart-wrap">
+                <TemperatureHistoryChart
+                  points={chartPoints}
+                  sensorName={sensorName}
+                  dailyWindowActive={dailyWindowActive}
+                />
+              </div>
+              <div className="temp-history-side">
+                <div className="temp-history-stats">
+                  <div className="temp-history-stat">
+                    <span className="temp-history-stat-label" aria-hidden>
+                      ↑
+                    </span>
+                    <span className="temp-history-stat-value">
+                      {displayStats ? formatTempF(displayStats.maxF) : "—"}
+                    </span>
+                    <span className="temp-history-stat-caption muted">Max</span>
+                  </div>
+                  <div className="temp-history-stat temp-history-stat-avg">
+                    <span className="temp-history-stat-label" aria-hidden>
+                      ·
+                    </span>
+                    <span className="temp-history-stat-value">
+                      {displayStats ? formatTempF(displayStats.avgF) : "—"}
+                    </span>
+                    <span className="temp-history-stat-caption muted">Avg</span>
+                  </div>
+                  <div className="temp-history-stat">
+                    <span className="temp-history-stat-label" aria-hidden>
+                      ↓
+                    </span>
+                    <span className="temp-history-stat-value">
+                      {displayStats ? formatTempF(displayStats.minF) : "—"}
+                    </span>
+                    <span className="temp-history-stat-caption muted">Min</span>
+                  </div>
                 </div>
-                <div className="temp-history-stat temp-history-stat-avg">
-                  <span className="temp-history-stat-label" aria-hidden>
-                    ·
+                <div className="temp-history-current">
+                  <span className="temp-history-current-heading">Latest</span>
+                  <span className="temp-history-current-when muted">
+                    {chartPoints.length > 0
+                      ? formatHoverDateTime(chartPoints[chartPoints.length - 1].at)
+                      : "—"}
                   </span>
-                  <span className="temp-history-stat-value">{st ? formatTempF(st.avgF) : "—"}</span>
-                  <span className="temp-history-stat-caption muted">Avg</span>
-                </div>
-                <div className="temp-history-stat">
-                  <span className="temp-history-stat-label" aria-hidden>
-                    ↓
+                  <span className="temp-history-current-value">
+                    {displayStats?.latestF != null ? formatTempF(displayStats.latestF) : "—"}
                   </span>
-                  <span className="temp-history-stat-value">{st ? formatTempF(st.minF) : "—"}</span>
-                  <span className="temp-history-stat-caption muted">Min</span>
                 </div>
               </div>
-              <div className="temp-history-current">
-                <span className="temp-history-current-heading">Latest</span>
-                <span className="temp-history-current-when muted">
-                  {data.points.length > 0
-                    ? formatHoverDateTime(data.points[data.points.length - 1].at)
-                    : "—"}
-                </span>
-                <span className="temp-history-current-value">{st?.latestF != null ? formatTempF(st.latestF) : "—"}</span>
-              </div>
             </div>
-          </div>
+          </>
         )}
       </div>
     </div>
@@ -572,6 +735,61 @@ function TemperatureHistoryModal({
 }
 
 export default function App() {
+  const [session, setSession] = useState<SessionInfo | null>(null);
+  const [sessionError, setSessionError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const s = await fetchSession();
+        if (!cancelled) setSession(s);
+      } catch {
+        if (!cancelled) {
+          setSessionError("Cannot reach the API server. Run npm run dev and ensure the proxy is up.");
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (session === null && !sessionError) {
+    return (
+      <div className="auth-screen">
+        <p className="muted">Checking session…</p>
+      </div>
+    );
+  }
+
+  if (sessionError) {
+    return (
+      <div className="auth-screen">
+        <div className="banner err">{sessionError}</div>
+      </div>
+    );
+  }
+
+  if (session!.authRequired && !session!.authenticated) {
+    return <Login onSuccess={() => setSession({ authRequired: true, authenticated: true })} />;
+  }
+
+  return (
+    <Dashboard
+      showSignOut={session!.authRequired}
+      onSignOut={() => setSession({ authRequired: true, authenticated: false })}
+    />
+  );
+}
+
+function Dashboard({
+  showSignOut,
+  onSignOut,
+}: {
+  showSignOut: boolean;
+  onSignOut: () => void;
+}) {
   const [tags, setTags] = useState<Tag[]>([]);
   const [selectedTagIds, setSelectedTagIds] = useState<Set<string>>(new Set());
   const [rows, setRows] = useState<Row[] | null>(null);
@@ -599,7 +817,7 @@ export default function App() {
     setLoadingTags(true);
     setTagError(null);
     try {
-      const r = await fetch("/api/tags");
+      const r = await apiFetch("/api/tags");
       const j: { data?: unknown; source?: "list" | "assets" | "empty"; error?: string; hint?: string } =
         await parseJsonSafe(r);
       if (!r.ok) {
@@ -618,7 +836,7 @@ export default function App() {
 
   const checkHealth = useCallback(async () => {
     try {
-      const r = await fetch("/api/health");
+      const r = await apiFetch("/api/health");
       const j = await r.json();
       if (!j.hasToken) {
         setConfigError("Server is running without SAMSARA_API_TOKEN. Add it to a .env file and restart.");
@@ -632,7 +850,7 @@ export default function App() {
 
   const loadSamsaraOrgId = useCallback(async () => {
     try {
-      const r = await fetch("/api/org-id");
+      const r = await apiFetch("/api/org-id");
       const j = await parseJsonSafe(r);
       if (!r.ok) {
         setSamsaraOrgId(null);
@@ -670,7 +888,7 @@ export default function App() {
       const q = selectedTagIds.size
         ? `?tagIds=${Array.from(selectedTagIds).map(encodeURIComponent).join(",")}`
         : "";
-      const r = await fetch(`/api/sensor-records${q}`);
+      const r = await apiFetch(`/api/sensor-records${q}`);
       const j: { data?: unknown; error?: string; hint?: string } = await parseJsonSafe(r);
       if (!r.ok) {
         const msg = [j.error, j.hint].filter(Boolean).join(" — ");
@@ -830,7 +1048,20 @@ export default function App() {
   return (
     <div className="app">
       <header className="header">
-        <h1>Canteen EM Sensor Health</h1>
+        <div className="header-top">
+          <h1>Canteen EM Sensor Health</h1>
+          {showSignOut && (
+            <button
+              type="button"
+              className="header-sign-out"
+              onClick={() => {
+                void logout().then(onSignOut);
+              }}
+            >
+              Sign out
+            </button>
+          )}
+        </div>
         <p className="lede">
           Sensors come from each tag’s <code>sensors</code> list on <strong>List tags</strong> (
           <code>GET /tags</code>). Readings use the <strong>Get Readings Snapshot</strong> API (
