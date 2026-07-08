@@ -14,6 +14,12 @@ import {
   validateCredentials,
 } from "./auth.mjs";
 import { MAX_NOTE_LENGTH, openSensorNotesDb } from "./notes-db.mjs";
+import {
+  EM_WIDGET_READING_IDS,
+  hasEmWidgetReadings,
+  isDeactivatedTagSensor,
+  isEmHealthTagSensor,
+} from "./sensorFilter.mjs";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const BASE = (process.env.SAMSARA_API_BASE ?? "https://api.samsara.com").replace(/\/$/, "");
@@ -24,16 +30,20 @@ const READINGS_ENTITY_TYPE = process.env.SAMSARA_READINGS_ENTITY_TYPE ?? "sensor
 /** Match public Samsara URLs: https://api.samsara.com/tags, /assets, /readings/latest (no /v1). Override with SAMSARA_PATH_STYLE=v1 if needed. */
 const DEFAULT_PATH_STYLE = process.env.SAMSARA_PATH_STYLE === "v1" ? "v1" : "root";
 
-const READING_IDS = [
-  "widgetBatteryVoltage",
-  "widgetBatteryVoltageLow",
-  "environmentMonitorAmbientTemperatureBLEConnection",
-].join(",");
+const READING_IDS = EM_WIDGET_READING_IDS.join(",");
 
 /** Single reading for GET /readings/history (query uses `readingId`, not `readingIds`). */
 const TEMP_BLE_READING_ID = "environmentMonitorAmbientTemperatureBLEConnection";
 
 const ENTITY_BATCH = 50;
+
+/** Parallel waves when fetching /readings/latest (default 4 batches at a time). */
+const READINGS_BATCH_CONCURRENCY = Math.max(
+  1,
+  Number(process.env.SAMSARA_READINGS_BATCH_CONCURRENCY ?? 4) || 4,
+);
+
+const STALE_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** Guard very deep pagination for one-sensor history (30 days). */
 const READINGS_HISTORY_MAX_PAGES = 500;
@@ -215,6 +225,132 @@ function chunk(arr, n) {
   return res;
 }
 
+/** Fetch readings snapshot for many sensors; batches run in parallel waves. */
+async function fetchReadingsSnapshotBatched(entityIds, readingIds = READING_IDS) {
+  const ids = [...new Set(entityIds.map(String))];
+  if (ids.length === 0) return [];
+  const batches = chunk(ids, ENTITY_BATCH);
+  const readingRows = [];
+  for (let i = 0; i < batches.length; i += READINGS_BATCH_CONCURRENCY) {
+    const wave = batches.slice(i, i + READINGS_BATCH_CONCURRENCY);
+    const parts = await Promise.all(
+      wave.map((batch) => {
+        const p = new URLSearchParams();
+        p.set("entityType", READINGS_ENTITY_TYPE);
+        p.set("readingIds", readingIds);
+        p.set("entityIds", batch.join(","));
+        return paginateReadingsSnapshot(p);
+      }),
+    );
+    for (const part of parts) readingRows.push(...part);
+  }
+  return readingRows;
+}
+
+function indexReadingsByEntity(readingRows) {
+  const readingsByEntity = new Map();
+  for (const row of readingRows) {
+    const eid = String(row.entityId);
+    if (!readingsByEntity.has(eid)) readingsByEntity.set(eid, new Map());
+    readingsByEntity.get(eid).set(row.readingId, {
+      value: row.value,
+      happenedAtTime: row.happenedAtTime,
+    });
+  }
+  return readingsByEntity;
+}
+
+function lastConnectedTimeFromMap(rmap) {
+  const t1 = rmap.get("widgetBatteryVoltage")?.happenedAtTime;
+  const t2 = rmap.get("widgetBatteryVoltageLow")?.happenedAtTime;
+  const t3 = rmap.get("environmentMonitorAmbientTemperatureBLEConnection")?.happenedAtTime;
+  const times = [t1, t2, t3].filter(Boolean);
+  if (times.length === 0) return null;
+  return times.reduce((best, t) => (new Date(t) > new Date(best) ? t : best), times[0]);
+}
+
+function connectivityCategory(lastConnectedIso, retrievedAt) {
+  if (lastConnectedIso == null || String(lastConnectedIso).trim() === "") return "never";
+  const t = new Date(lastConnectedIso).getTime();
+  if (Number.isNaN(t)) return "never";
+  if (retrievedAt - t > STALE_MS) return "stale";
+  return "connected";
+}
+
+function uniqueSensorIdsFromTagRows(tagRows) {
+  const ids = new Set();
+  for (const tag of tagRows) {
+    if (!Array.isArray(tag?.sensors)) continue;
+    for (const s of tag.sensors) {
+      if (s?.id == null || isDeactivatedTagSensor(s)) continue;
+      ids.add(String(s.id));
+    }
+  }
+  return [...ids];
+}
+
+function buildTagHealthSummaryFromTagRows(tagRows, readingsByEntity, retrievedAt) {
+  const rows = [];
+  for (const tag of tagRows) {
+    if (!tag || tag.id == null) continue;
+    const tagName = tag.name != null ? String(tag.name) : "—";
+    const sensors = Array.isArray(tag.sensors) ? tag.sensors : [];
+    let totalSensors = 0;
+    let connectedLast7Days = 0;
+    let notConnected7Days = 0;
+    let neverConnected = 0;
+    for (const s of sensors) {
+      if (!s || s.id == null || !isEmHealthTagSensor(s, readingsByEntity)) continue;
+      totalSensors += 1;
+      const rmap = readingsByEntity.get(String(s.id)) || new Map();
+      const cat = connectivityCategory(lastConnectedTimeFromMap(rmap), retrievedAt);
+      if (cat === "never") neverConnected += 1;
+      else if (cat === "stale") notConnected7Days += 1;
+      else connectedLast7Days += 1;
+    }
+    if (totalSensors === 0) continue;
+    const pctHealthy = (connectedLast7Days / totalSensors) * 100;
+    rows.push({
+      tagId: String(tag.id),
+      tagName,
+      totalSensors,
+      connectedLast7Days,
+      notConnected7Days,
+      neverConnected,
+      pctHealthy,
+    });
+  }
+  rows.sort((a, b) => a.tagName.localeCompare(b.tagName, undefined, { sensitivity: "base" }));
+  return rows;
+}
+
+function buildFleetHealthTotals(tagRows, readingsByEntity, retrievedAt) {
+  const seen = new Set();
+  let totalSensors = 0;
+  let connectedLast7Days = 0;
+  let neverConnected = 0;
+  let notConnected7Days = 0;
+
+  for (const tag of tagRows) {
+    if (!Array.isArray(tag?.sensors)) continue;
+    for (const s of tag.sensors) {
+      if (!s || s.id == null || !isEmHealthTagSensor(s, readingsByEntity)) continue;
+      const sid = String(s.id);
+      if (seen.has(sid)) continue;
+      seen.add(sid);
+      totalSensors += 1;
+      const rmap = readingsByEntity.get(sid) || new Map();
+      const cat = connectivityCategory(lastConnectedTimeFromMap(rmap), retrievedAt);
+      if (cat === "never") neverConnected += 1;
+      else if (cat === "stale") notConnected7Days += 1;
+      else if (cat === "connected") connectedLast7Days += 1;
+    }
+  }
+
+  const pctHealthy = totalSensors > 0 ? (connectedLast7Days / totalSensors) * 100 : 0;
+  return { totalSensors, connectedLast7Days, neverConnected, notConnected7Days, pctHealthy };
+}
+
 function sortTagMap(tagMap) {
   return Array.from(tagMap.values()).sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
 }
@@ -233,7 +369,7 @@ function collectSensorsFromTagRows(tagRows, filterTagIds) {
     if (filter && !filter.has(tagId)) continue;
     const sensors = Array.isArray(tag.sensors) ? tag.sensors : [];
     for (const s of sensors) {
-      if (!s || s.id == null) continue;
+      if (!s || s.id == null || isDeactivatedTagSensor(s)) continue;
       const sid = String(s.id);
       const sname = s.name != null ? String(s.name) : "—";
       if (!bySensor.has(sid)) {
@@ -373,6 +509,42 @@ app.get("/api/tags", async (_req, res) => {
   });
 });
 
+/** Per-tag connectivity summary; aggregates on the server (one tags fetch + parallel readings). */
+app.get("/api/health-summary", async (_req, res) => {
+  if (!requireToken(res)) return;
+  try {
+    const retrievedAt = Date.now();
+    const tagRows = await paginateList("/tags", new URLSearchParams({ limit: "512" }));
+    const sensorIds = uniqueSensorIdsFromTagRows(tagRows);
+    if (sensorIds.length === 0) {
+      return res.json({
+        dataRetrievedAt: retrievedAt,
+        data: [],
+        fleetTotals: {
+          totalSensors: 0,
+          connectedLast7Days: 0,
+          neverConnected: 0,
+          notConnected7Days: 0,
+          pctHealthy: 0,
+        },
+      });
+    }
+
+    const readingRows = await fetchReadingsSnapshotBatched(sensorIds);
+    const readingsByEntity = indexReadingsByEntity(readingRows);
+    const data = buildTagHealthSummaryFromTagRows(tagRows, readingsByEntity, retrievedAt);
+    const fleetTotals = buildFleetHealthTotals(tagRows, readingsByEntity, retrievedAt);
+
+    res.json({ dataRetrievedAt: retrievedAt, data, fleetTotals });
+  } catch (e) {
+    res.status(e.status || 500).json({
+      error: e.message,
+      details: e.body,
+      hint: "Confirm Read Tags and Read Readings on the API token. Tags must return a sensors list.",
+    });
+  }
+});
+
 app.get("/api/sensor-records", async (req, res) => {
   if (!requireToken(res)) return;
   const tagIds = req.query.tagIds
@@ -389,41 +561,15 @@ app.get("/api/sensor-records", async (req, res) => {
       return res.json({ data: [] });
     }
 
-    const readingRows = [];
-    for (const batch of chunk(
-      sensorList.map((s) => s.id),
-      ENTITY_BATCH,
-    )) {
-      const p = new URLSearchParams();
-      p.set("entityType", READINGS_ENTITY_TYPE);
-      p.set("readingIds", READING_IDS);
-      p.set("entityIds", batch.join(","));
-      const part = await paginateReadingsSnapshot(p);
-      readingRows.push(...part);
-    }
-
-    const readingsByEntity = new Map();
-    for (const row of readingRows) {
-      const eid = String(row.entityId);
-      if (!readingsByEntity.has(eid)) readingsByEntity.set(eid, new Map());
-      readingsByEntity.get(eid).set(row.readingId, {
-        value: row.value,
-        happenedAtTime: row.happenedAtTime,
-      });
-    }
+    const readingRows = await fetchReadingsSnapshotBatched(sensorList.map((s) => s.id));
+    const readingsByEntity = indexReadingsByEntity(readingRows);
 
     const records = [];
     for (const s of sensorList) {
       const id = s.id;
       const rmap = readingsByEntity.get(id) || new Map();
-      const t1 = rmap.get("widgetBatteryVoltage")?.happenedAtTime;
-      const t2 = rmap.get("widgetBatteryVoltageLow")?.happenedAtTime;
-      const t3 = rmap.get("environmentMonitorAmbientTemperatureBLEConnection")?.happenedAtTime;
-      const times = [t1, t2, t3].filter(Boolean);
-      const lastTime =
-        times.length > 0
-          ? times.reduce((best, t) => (new Date(t) > new Date(best) ? t : best), times[0])
-          : null;
+      if (!hasEmWidgetReadings(rmap)) continue;
+      const lastTime = lastConnectedTimeFromMap(rmap);
 
       const wbv = rmap.get("widgetBatteryVoltage")?.value;
       const wbl = rmap.get("widgetBatteryVoltageLow")?.value;

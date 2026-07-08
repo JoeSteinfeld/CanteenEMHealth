@@ -1,6 +1,6 @@
-import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { openSqliteDb } from "./sqlite-open.mjs";
 
 /** Minimum gap between `site_access` rows for the same user + IP (return visits / refreshes). */
 const SITE_ACCESS_DEDUPE_MS = 15 * 60 * 1000;
@@ -14,20 +14,20 @@ const MAX_UA_LEN = 512;
  */
 export function openAuditDb(dbPath) {
   mkdirSync(dirname(dbPath), { recursive: true });
-  const db = new Database(dbPath);
-  db.pragma("journal_mode = WAL");
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS access_log (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      at INTEGER NOT NULL,
-      event TEXT NOT NULL,
-      username TEXT,
-      ip TEXT NOT NULL,
-      user_agent TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_access_log_at ON access_log (at DESC);
-    CREATE INDEX IF NOT EXISTS idx_access_log_event_at ON access_log (event, at DESC);
-  `);
+  const db = openSqliteDb(dbPath, (conn) => {
+    conn.exec(`
+      CREATE TABLE IF NOT EXISTS access_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        at INTEGER NOT NULL,
+        event TEXT NOT NULL,
+        username TEXT,
+        ip TEXT NOT NULL,
+        user_agent TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_access_log_at ON access_log (at DESC);
+      CREATE INDEX IF NOT EXISTS idx_access_log_event_at ON access_log (event, at DESC);
+    `);
+  });
 
   const insertStmt = db.prepare(`
     INSERT INTO access_log (at, event, username, ip, user_agent)

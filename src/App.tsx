@@ -1,19 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { apiFetch, fetchSession, logout, type SessionInfo } from "./auth";
+import { BrowserRouter, Navigate, Route, Routes, useSearchParams } from "react-router-dom";
+import { parseJsonSafe } from "./apiUtils";
+import { apiFetch, fetchSession, type SessionInfo } from "./auth";
+import { AppShell } from "./AppShell";
+import { HealthSummary } from "./HealthSummary";
+import { HealthSummaryCacheProvider } from "./healthSummaryCache";
 import { Login } from "./Login";
+import {
+  categorizeSensorHealth,
+  isBatteryVoltageLowIndicated,
+  isLastConnectedStale,
+  isMissingLastConnected,
+  tagNamesForRow,
+  type HealthCategory,
+  type SensorRow,
+} from "./sensorHealth";
 import "./App.css";
 
-type Tag = { id: string | number; name: string };
-type Row = {
-  id: string;
-  name: string;
-  tagValue: string;
-  lastConnectedTime: string | null;
-  batteryVoltage: string;
-  batteryVoltageLow: string;
-  temperature: string;
-  note: string;
-};
+type Row = SensorRow;
 
 type SortKey = keyof Row | "action";
 type SortDir = "asc" | "desc";
@@ -35,7 +39,7 @@ type TempHistoryPayload = {
   stats: TempHistoryStats | null;
 };
 
-type HealthCategory = "never" | "stale" | "recentLow" | "recentOk";
+type Tag = { id: string | number; name: string };
 
 const HEALTH_CATEGORY_CONFIG: { key: HealthCategory; label: string; aria: string }[] = [
   { key: "never", label: "# never connected", aria: "Filter list by: never connected" },
@@ -83,16 +87,6 @@ function buildSamsaraSensorConfigSensorsUrl(orgId: string, sensorName: string): 
 
 function hasColumnSearch(filters: Record<TableColumnKey, string>): boolean {
   return TABLE_COLUMNS.some((c) => filters[c.key].trim() !== "");
-}
-
-async function parseJsonSafe(r: Response): Promise<Record<string, unknown>> {
-  const t = await r.text();
-  if (!t) return {};
-  try {
-    return JSON.parse(t) as Record<string, unknown>;
-  } catch {
-    throw new Error(`Not JSON (HTTP ${r.status}): ${t.slice(0, 200)}`);
-  }
 }
 
 function SensorNoteField({
@@ -776,24 +770,34 @@ export default function App() {
   }
 
   return (
-    <Dashboard
-      showSignOut={session!.authRequired}
-      onSignOut={() => setSession({ authRequired: true, authenticated: false })}
-    />
+    <HealthSummaryCacheProvider>
+      <BrowserRouter>
+        <Routes>
+          <Route
+            element={
+              <AppShell
+                showSignOut={session!.authRequired}
+                onSignOut={() => setSession({ authRequired: true, authenticated: false })}
+              />
+            }
+          >
+            <Route path="/health-summary" element={<HealthSummary />} />
+            <Route path="/detailed-sensor-health" element={<Dashboard />} />
+            <Route path="/" element={<Navigate to="/detailed-sensor-health" replace />} />
+            <Route path="*" element={<Navigate to="/detailed-sensor-health" replace />} />
+          </Route>
+        </Routes>
+      </BrowserRouter>
+    </HealthSummaryCacheProvider>
   );
 }
 
-function Dashboard({
-  showSignOut,
-  onSignOut,
-}: {
-  showSignOut: boolean;
-  onSignOut: () => void;
-}) {
+function Dashboard() {
+  const [searchParams, setSearchParams] = useSearchParams();
   const [tags, setTags] = useState<Tag[]>([]);
   const [selectedTagIds, setSelectedTagIds] = useState<Set<string>>(new Set());
   const [rows, setRows] = useState<Row[] | null>(null);
-  const [loadingTags, setLoadingTags] = useState(false);
+  const [loadingTags, setLoadingTags] = useState(true);
   const [loadingData, setLoadingData] = useState(false);
   const [tagError, setTagError] = useState<string | null>(null);
   const [dataError, setDataError] = useState<string | null>(null);
@@ -812,6 +816,7 @@ function Dashboard({
   const [samsaraOrgId, setSamsaraOrgId] = useState<string | null>(null);
   /** Row for which the temperature history modal is open (on-demand /readings/history). */
   const [tempHistoryRow, setTempHistoryRow] = useState<{ id: string; name: string } | null>(null);
+  const deepLinkHandledRef = useRef<string | null>(null);
 
   const loadTags = useCallback(async () => {
     setLoadingTags(true);
@@ -878,16 +883,14 @@ function Dashboard({
     });
   };
 
-  const loadRecords = async () => {
+  const loadRecordsForTagIds = useCallback(async (tagIds: Set<string>) => {
     setLoadingData(true);
     setDataError(null);
     setRows(null);
     setDataRetrievedAt(null);
     setColumnSearch(emptyColumnSearch());
     try {
-      const q = selectedTagIds.size
-        ? `?tagIds=${Array.from(selectedTagIds).map(encodeURIComponent).join(",")}`
-        : "";
+      const q = tagIds.size ? `?tagIds=${Array.from(tagIds).map(encodeURIComponent).join(",")}` : "";
       const r = await apiFetch(`/api/sensor-records${q}`);
       const j: { data?: unknown; error?: string; hint?: string } = await parseJsonSafe(r);
       if (!r.ok) {
@@ -902,7 +905,34 @@ function Dashboard({
     } finally {
       setLoadingData(false);
     }
-  };
+  }, []);
+
+  const loadRecords = useCallback(() => loadRecordsForTagIds(selectedTagIds), [loadRecordsForTagIds, selectedTagIds]);
+
+  useEffect(() => {
+    if (loadingTags) return;
+    const tagId = searchParams.get("tagId");
+    const tagName = searchParams.get("tagName");
+    if (!tagId && !tagName) return;
+
+    const paramKey = tagId ? `id:${tagId}` : `name:${tagName}`;
+    if (deepLinkHandledRef.current === paramKey) return;
+
+    const tag = tagId
+      ? tags.find((t) => String(t.id) === tagId)
+      : tags.find((t) => t.name === tagName);
+    if (!tag) {
+      deepLinkHandledRef.current = paramKey;
+      setSearchParams({}, { replace: true });
+      return;
+    }
+
+    deepLinkHandledRef.current = paramKey;
+    const ids = new Set([String(tag.id)]);
+    setSelectedTagIds(ids);
+    setSearchParams({}, { replace: true });
+    void loadRecordsForTagIds(ids);
+  }, [searchParams, tags, loadingTags, setSearchParams, loadRecordsForTagIds]);
 
   const onSort = (key: SortKey) => {
     if (sortKey === key) {
@@ -1048,23 +1078,10 @@ function Dashboard({
   return (
     <div className="app">
       <header className="header">
-        <div className="header-top">
-          <h1>Canteen EM Sensor Health</h1>
-          {showSignOut && (
-            <button
-              type="button"
-              className="header-sign-out"
-              onClick={() => {
-                void logout().then(onSignOut);
-              }}
-            >
-              Sign out
-            </button>
-          )}
-        </div>
+        <h1>Detailed Sensor Health</h1>
         <p className="lede">
           Sensors come from each tag’s <code>sensors</code> list on <strong>List tags</strong> (
-          <code>GET /tags</code>). Readings use the <strong>Get Readings Snapshot</strong> API (
+          <code>GET /tags</code>), limited to EM environment monitors (deactivated placeholders and non-EM devices on tags are excluded). Readings use the <strong>Get Readings Snapshot</strong> API (
           <code>GET /readings/latest</code> with <code>entityType=sensor</code>) for widget and environmental
           monitor fields. Click a <strong>temperature</strong> value to load a 30-day chart from{" "}
           <code>GET /readings/history</code> for that sensor only.
@@ -1443,60 +1460,6 @@ function Dashboard({
       />
     </div>
   );
-}
-
-const STALE_MS = 7 * 24 * 60 * 60 * 1000;
-
-/** No usable last-connected timestamp (null, empty, or unparseable). */
-function isMissingLastConnected(lastConnectedIso: string | null): boolean {
-  if (lastConnectedIso == null) return true;
-  const s = String(lastConnectedIso).trim();
-  if (!s) return true;
-  const t = new Date(s).getTime();
-  return Number.isNaN(t);
-}
-
-/** True if last connected is strictly more than 7 days before `retrievedAt`. */
-function isLastConnectedStale(lastConnectedIso: string | null, retrievedAt: number | null): boolean {
-  if (isMissingLastConnected(lastConnectedIso) || retrievedAt == null) return false;
-  const t = new Date(lastConnectedIso).getTime();
-  return retrievedAt - t > STALE_MS;
-}
-
-/**
- * True if the display value from widgetBatteryVoltageLow indicates a low battery
- * (boolean true, common string enums, or substring "low").
- */
-function isBatteryVoltageLowIndicated(batteryVoltageLowDisplay: string): boolean {
-  const s = batteryVoltageLowDisplay.trim().toLowerCase();
-  if (!s || s === "—") return false;
-  if (s === "true" || s === "1" || s === "yes") return true;
-  if (s === "false" || s === "0" || s === "no") return false;
-  if (s.includes("low")) return true;
-  return false;
-}
-
-/** Server joins tag names with ", " — one sensor may be counted in multiple tag columns. */
-function tagNamesForRow(r: Row): string[] {
-  const s = r.tagValue.trim();
-  if (!s) return [];
-  return s.split(", ")
-    .map((x) => x.trim())
-    .filter(Boolean);
-}
-
-function categorizeSensorHealth(r: Row, dataRetrievedAt: number | null): HealthCategory {
-  if (dataRetrievedAt == null) return "never";
-  if (isMissingLastConnected(r.lastConnectedTime)) return "never";
-  if (isLastConnectedStale(r.lastConnectedTime, dataRetrievedAt)) return "stale";
-  if (
-    isBatteryVoltageLowIndicated(r.batteryVoltageLow) &&
-    !isMissingLastConnected(r.lastConnectedTime) &&
-    !isLastConnectedStale(r.lastConnectedTime, dataRetrievedAt)
-  ) {
-    return "recentLow";
-  }
-  return "recentOk";
 }
 
 function formatTime(iso: string) {

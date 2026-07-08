@@ -1,6 +1,6 @@
-import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { openSqliteDb } from "./sqlite-open.mjs";
 
 /** Max UTF-8 length for a single note (reasonable bound for UI + DB). */
 export const MAX_NOTE_LENGTH = 32_000;
@@ -10,15 +10,15 @@ export const MAX_NOTE_LENGTH = 32_000;
  */
 export function openSensorNotesDb(dbPath) {
   mkdirSync(dirname(dbPath), { recursive: true });
-  const db = new Database(dbPath);
-  db.pragma("journal_mode = WAL");
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS sensor_notes (
-      sensor_id TEXT PRIMARY KEY NOT NULL,
-      note TEXT NOT NULL DEFAULT '',
-      updated_at INTEGER NOT NULL
-    );
-  `);
+  const db = openSqliteDb(dbPath, (conn) => {
+    conn.exec(`
+      CREATE TABLE IF NOT EXISTS sensor_notes (
+        sensor_id TEXT PRIMARY KEY NOT NULL,
+        note TEXT NOT NULL DEFAULT '',
+        updated_at INTEGER NOT NULL
+      );
+    `);
+  });
 
   const selectManyIn = (ids) => {
     if (ids.length === 0) return [];
