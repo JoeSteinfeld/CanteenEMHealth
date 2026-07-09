@@ -14,6 +14,7 @@ import {
   validateCredentials,
 } from "./auth.mjs";
 import { MAX_NOTE_LENGTH, openSensorNotesDb } from "./notes-db.mjs";
+import { openHealthSummaryDb } from "./health-summary-db.mjs";
 import {
   EM_WIDGET_READING_IDS,
   hasEmWidgetReadings,
@@ -50,8 +51,11 @@ const READINGS_HISTORY_MAX_PAGES = 500;
 
 const NOTES_DB_PATH = process.env.NOTES_DB_PATH ?? join(process.cwd(), "data", "sensor-notes.sqlite");
 const AUDIT_DB_PATH = process.env.AUDIT_DB_PATH ?? join(process.cwd(), "data", "access-audit.sqlite");
+const HEALTH_SUMMARY_DB_PATH =
+  process.env.HEALTH_SUMMARY_DB_PATH ?? join(process.cwd(), "data", "health-summary.sqlite");
 const notesStore = openSensorNotesDb(NOTES_DB_PATH);
 const auditLog = openAuditDb(AUDIT_DB_PATH);
+const healthSummaryStore = openHealthSummaryDb(HEALTH_SUMMARY_DB_PATH);
 
 function auditFromRequest(req, event, username = null) {
   auditLog.record({
@@ -510,6 +514,27 @@ app.get("/api/tags", async (_req, res) => {
 });
 
 /** Per-tag connectivity summary; aggregates on the server (one tags fetch + parallel readings). */
+app.get("/api/health-summary/snapshot", (_req, res) => {
+  if (!requireToken(res)) return;
+  try {
+    const snapshot = healthSummaryStore.getLatestSnapshot();
+    if (!snapshot) {
+      return res.json({ data: null, fleetTotals: null, dataRetrievedAt: null, storedAt: null });
+    }
+    res.json({
+      data: snapshot.summaryRows,
+      fleetTotals: snapshot.fleetTotals,
+      dataRetrievedAt: snapshot.dataRetrievedAt,
+      storedAt: snapshot.storedAt,
+    });
+  } catch (e) {
+    res.status(500).json({
+      error: e instanceof Error ? e.message : "Failed to load health summary snapshot",
+    });
+  }
+});
+
+/** Per-tag connectivity summary; aggregates on the server (one tags fetch + parallel readings). */
 app.get("/api/health-summary", async (_req, res) => {
   if (!requireToken(res)) return;
   try {
@@ -517,7 +542,7 @@ app.get("/api/health-summary", async (_req, res) => {
     const tagRows = await paginateList("/tags", new URLSearchParams({ limit: "512" }));
     const sensorIds = uniqueSensorIdsFromTagRows(tagRows);
     if (sensorIds.length === 0) {
-      return res.json({
+      const payload = {
         dataRetrievedAt: retrievedAt,
         data: [],
         fleetTotals: {
@@ -527,13 +552,25 @@ app.get("/api/health-summary", async (_req, res) => {
           notConnected7Days: 0,
           pctHealthy: 0,
         },
+      };
+      healthSummaryStore.saveSnapshot({
+        dataRetrievedAt: retrievedAt,
+        fleetTotals: payload.fleetTotals,
+        summaryRows: payload.data,
       });
+      return res.json(payload);
     }
 
     const readingRows = await fetchReadingsSnapshotBatched(sensorIds);
     const readingsByEntity = indexReadingsByEntity(readingRows);
     const data = buildTagHealthSummaryFromTagRows(tagRows, readingsByEntity, retrievedAt);
     const fleetTotals = buildFleetHealthTotals(tagRows, readingsByEntity, retrievedAt);
+
+    healthSummaryStore.saveSnapshot({
+      dataRetrievedAt: retrievedAt,
+      fleetTotals,
+      summaryRows: data,
+    });
 
     res.json({ dataRetrievedAt: retrievedAt, data, fleetTotals });
   } catch (e) {

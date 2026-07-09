@@ -18,6 +18,12 @@ export type PersistedHealthSummary = {
   columnSearch: Record<TagHealthSummarySortKey, string>;
 };
 
+export type PersistedHealthSummaryUi = {
+  sortKey: TagHealthSummarySortKey;
+  sortDir: SortDir;
+  columnSearch: Record<TagHealthSummarySortKey, string>;
+};
+
 function isTagHealthSummaryRow(value: unknown): value is TagHealthSummaryRow {
   if (!value || typeof value !== "object") return false;
   const r = value as Record<string, unknown>;
@@ -64,6 +70,23 @@ function isFleetHealthTotals(value: unknown): value is FleetHealthTotals {
     typeof o.notConnected7Days === "number" &&
     typeof o.pctHealthy === "number"
   );
+}
+
+export function loadPersistedHealthSummaryUi(): PersistedHealthSummaryUi {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) {
+      return { sortKey: "tagName", sortDir: "asc", columnSearch: emptySummaryColumnSearch() };
+    }
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    return {
+      sortKey: isSortKey(parsed.sortKey) ? parsed.sortKey : "tagName",
+      sortDir: parsed.sortDir === "desc" ? "desc" : "asc",
+      columnSearch: parseColumnSearch(parsed.columnSearch),
+    };
+  } catch {
+    return { sortKey: "tagName", sortDir: "asc", columnSearch: emptySummaryColumnSearch() };
+  }
 }
 
 export function loadPersistedHealthSummary(): PersistedHealthSummary | null {

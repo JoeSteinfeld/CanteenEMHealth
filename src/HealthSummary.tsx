@@ -52,6 +52,7 @@ export function HealthSummary() {
     summaryRows,
     fleetTotals,
     dataRetrievedAt,
+    snapshotLoading,
     sortKey,
     sortDir,
     columnSearch,
@@ -193,6 +194,11 @@ export function HealthSummary() {
           >
             Export CSV
           </button>
+          {snapshotLoading && summaryRows == null && (
+            <p className="summary-last-refreshed" role="status">
+              Loading saved health summary…
+            </p>
+          )}
           {dataRetrievedAt != null && summaryRows != null && (
             <p className="summary-last-refreshed" role="status">
               Last refreshed: <time dateTime={new Date(dataRetrievedAt).toISOString()}>{formatLastRefreshed(dataRetrievedAt)}</time>
@@ -317,10 +323,17 @@ export function HealthSummary() {
               </tr>
             </thead>
             <tbody>
-              {summaryRows === null && (
+              {summaryRows === null && !snapshotLoading && (
                 <tr>
                   <td colSpan={SUMMARY_COLUMNS.length} className="muted">
                     Run <strong>Load health summary</strong> to query Samsara.
+                  </td>
+                </tr>
+              )}
+              {summaryRows === null && snapshotLoading && (
+                <tr>
+                  <td colSpan={SUMMARY_COLUMNS.length} className="muted">
+                    Loading saved health summary…
                   </td>
                 </tr>
               )}
