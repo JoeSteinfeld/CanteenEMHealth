@@ -15,7 +15,11 @@ import {
   type TagHealthSummaryRow,
   type TagHealthSummarySortKey,
 } from "./sensorHealth";
-import { loadPersistedHealthSummaryUi, savePersistedHealthSummary } from "./healthSummaryStorage";
+import {
+  loadPersistedHealthSummary,
+  loadPersistedHealthSummaryUi,
+  savePersistedHealthSummary,
+} from "./healthSummaryStorage";
 
 type SortDir = "asc" | "desc";
 
@@ -63,15 +67,61 @@ function isTagHealthSummaryRow(value: unknown): value is TagHealthSummaryRow {
   );
 }
 
+function normalizeSummaryRows(rows: TagHealthSummaryRow[]): TagHealthSummaryRow[] {
+  return rows.filter((row) => row.totalSensors > 0);
+}
+
+type SnapshotPayload = {
+  summaryRows: TagHealthSummaryRow[];
+  fleetTotals: FleetHealthTotals;
+  dataRetrievedAt: number;
+};
+
+function parseSnapshotResponse(j: {
+  data?: unknown;
+  fleetTotals?: unknown;
+  dataRetrievedAt?: unknown;
+}): SnapshotPayload | null {
+  const retrievedAt =
+    typeof j.dataRetrievedAt === "number" && Number.isFinite(j.dataRetrievedAt) ? j.dataRetrievedAt : null;
+  const list = Array.isArray(j.data) ? j.data.filter(isTagHealthSummaryRow) : null;
+  const totals = isFleetHealthTotals(j.fleetTotals) ? j.fleetTotals : null;
+  if (retrievedAt == null || list == null || totals == null) return null;
+  return {
+    summaryRows: normalizeSummaryRows(list),
+    fleetTotals: totals,
+    dataRetrievedAt: retrievedAt,
+  };
+}
+
+async function restoreSnapshotToServer(payload: SnapshotPayload): Promise<void> {
+  try {
+    await apiFetch("/api/health-summary/snapshot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        dataRetrievedAt: payload.dataRetrievedAt,
+        fleetTotals: payload.fleetTotals,
+        summaryRows: payload.summaryRows,
+      }),
+    });
+  } catch {
+    /* best effort — browser cache still shows the summary */
+  }
+}
+
 export function HealthSummaryCacheProvider({ children }: { children: ReactNode }) {
+  const persisted = loadPersistedHealthSummary();
   const ui = loadPersistedHealthSummaryUi();
-  const [summaryRows, setSummaryRows] = useState<TagHealthSummaryRow[] | null>(null);
-  const [fleetTotals, setFleetTotals] = useState<FleetHealthTotals | null>(null);
-  const [dataRetrievedAt, setDataRetrievedAt] = useState<number | null>(null);
+  const [summaryRows, setSummaryRows] = useState<TagHealthSummaryRow[] | null>(
+    persisted ? normalizeSummaryRows(persisted.summaryRows) : null,
+  );
+  const [fleetTotals, setFleetTotals] = useState<FleetHealthTotals | null>(persisted?.fleetTotals ?? null);
+  const [dataRetrievedAt, setDataRetrievedAt] = useState<number | null>(persisted?.dataRetrievedAt ?? null);
   const [snapshotLoading, setSnapshotLoading] = useState(true);
-  const [sortKey, setSortKey] = useState<TagHealthSummarySortKey>(ui.sortKey);
-  const [sortDir, setSortDir] = useState<SortDir>(ui.sortDir);
-  const [columnSearch, setColumnSearch] = useState(ui.columnSearch);
+  const [sortKey, setSortKey] = useState<TagHealthSummarySortKey>(persisted?.sortKey ?? ui.sortKey);
+  const [sortDir, setSortDir] = useState<SortDir>(persisted?.sortDir ?? ui.sortDir);
+  const [columnSearch, setColumnSearch] = useState(persisted?.columnSearch ?? ui.columnSearch);
 
   useEffect(() => {
     let cancelled = false;
@@ -86,18 +136,34 @@ export function HealthSummaryCacheProvider({ children }: { children: ReactNode }
         };
         if (cancelled || !r.ok) return;
 
-        const retrievedAt =
-          typeof j.dataRetrievedAt === "number" && Number.isFinite(j.dataRetrievedAt) ? j.dataRetrievedAt : null;
-        const list = Array.isArray(j.data) ? j.data.filter(isTagHealthSummaryRow) : null;
-        const totals = isFleetHealthTotals(j.fleetTotals) ? j.fleetTotals : null;
+        const serverSnapshot = parseSnapshotResponse(j);
+        const localSnapshot = persisted ? parseSnapshotResponse(persisted) : null;
 
-        if (retrievedAt != null && list != null && totals != null) {
-          setSummaryRows(list.filter((row) => row.totalSensors > 0));
-          setFleetTotals(totals);
-          setDataRetrievedAt(retrievedAt);
+        if (serverSnapshot && localSnapshot) {
+          const useServer = serverSnapshot.dataRetrievedAt >= localSnapshot.dataRetrievedAt;
+          const chosen = useServer ? serverSnapshot : localSnapshot;
+          setSummaryRows(chosen.summaryRows);
+          setFleetTotals(chosen.fleetTotals);
+          setDataRetrievedAt(chosen.dataRetrievedAt);
+          if (!useServer) void restoreSnapshotToServer(localSnapshot);
+          return;
+        }
+
+        if (serverSnapshot) {
+          setSummaryRows(serverSnapshot.summaryRows);
+          setFleetTotals(serverSnapshot.fleetTotals);
+          setDataRetrievedAt(serverSnapshot.dataRetrievedAt);
+          return;
+        }
+
+        if (localSnapshot) {
+          setSummaryRows(localSnapshot.summaryRows);
+          setFleetTotals(localSnapshot.fleetTotals);
+          setDataRetrievedAt(localSnapshot.dataRetrievedAt);
+          void restoreSnapshotToServer(localSnapshot);
         }
       } catch {
-        /* server snapshot unavailable — user can refresh manually */
+        /* server snapshot unavailable — browser cache (if any) remains visible */
       } finally {
         if (!cancelled) setSnapshotLoading(false);
       }

@@ -6,6 +6,8 @@ import { AppShell } from "./AppShell";
 import { HealthSummary } from "./HealthSummary";
 import { HealthSummaryCacheProvider } from "./healthSummaryCache";
 import { Login } from "./Login";
+import { TrendsCacheProvider } from "./trendsCache";
+import { Trends } from "./Trends";
 import {
   categorizeSensorHealth,
   isBatteryVoltageLowIndicated,
@@ -771,23 +773,26 @@ export default function App() {
 
   return (
     <HealthSummaryCacheProvider>
-      <BrowserRouter>
-        <Routes>
-          <Route
-            element={
-              <AppShell
-                showSignOut={session!.authRequired}
-                onSignOut={() => setSession({ authRequired: true, authenticated: false })}
-              />
-            }
-          >
-            <Route path="/health-summary" element={<HealthSummary />} />
-            <Route path="/detailed-sensor-health" element={<Dashboard />} />
-            <Route path="/" element={<Navigate to="/detailed-sensor-health" replace />} />
-            <Route path="*" element={<Navigate to="/detailed-sensor-health" replace />} />
-          </Route>
-        </Routes>
-      </BrowserRouter>
+      <TrendsCacheProvider>
+        <BrowserRouter>
+          <Routes>
+            <Route
+              element={
+                <AppShell
+                  showSignOut={session!.authRequired}
+                  onSignOut={() => setSession({ authRequired: true, authenticated: false })}
+                />
+              }
+            >
+              <Route path="/health-summary" element={<HealthSummary />} />
+              <Route path="/trends" element={<Trends />} />
+              <Route path="/detailed-sensor-health" element={<Dashboard />} />
+              <Route path="/" element={<Navigate to="/detailed-sensor-health" replace />} />
+              <Route path="*" element={<Navigate to="/detailed-sensor-health" replace />} />
+            </Route>
+          </Routes>
+        </BrowserRouter>
+      </TrendsCacheProvider>
     </HealthSummaryCacheProvider>
   );
 }

@@ -14,6 +14,7 @@ import {
   type FleetHealthTotals,
 } from "./sensorHealth";
 import { downloadHealthSummaryCsv } from "./healthSummaryExport";
+import { DailySnapshotNotice } from "./DailySnapshotNotice";
 
 type SortDir = "asc" | "desc";
 
@@ -170,12 +171,14 @@ export function HealthSummary() {
     <div className="app">
       <header className="header">
         <h1>Health Summary</h1>
+        <DailySnapshotNotice />
         <p className="lede">
           Per-tag EM sensor health based on last-connected time from{" "}
           <code>GET /readings/latest</code>. A sensor counts as <strong>connected in the last 7 days</strong> if it
           reported within 7 days of when data was loaded. Totals include EM environment monitors only
           (deactivated placeholders and non-EM devices on tags are excluded). Fleet totals count each sensor once; the table below may
-          count sensors under multiple tags.
+          count sensors under multiple tags. You can also refresh manually anytime; Trends uses the daily snapshots for
+          org health over time.
         </p>
       </header>
 

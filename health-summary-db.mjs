@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { openSqliteDb } from "./sqlite-open.mjs";
+import { openSqliteDb, checkpointSqliteDb } from "./sqlite-open.mjs";
 
 function isTagHealthSummaryRow(value) {
   if (!value || typeof value !== "object") return false;
@@ -71,11 +71,37 @@ export function openHealthSummaryDb(dbPath) {
   `);
 
   const selectLatestStmt = db.prepare(`
-    SELECT data_retrieved_at, fleet_totals_json, summary_rows_json, created_at
+    SELECT id, data_retrieved_at, fleet_totals_json, summary_rows_json, created_at
     FROM health_summary_snapshots
     ORDER BY data_retrieved_at DESC, id DESC
     LIMIT 1
   `);
+
+  const selectListStmt = db.prepare(`
+    SELECT id, data_retrieved_at, fleet_totals_json, summary_rows_json, created_at
+    FROM health_summary_snapshots
+    ORDER BY data_retrieved_at DESC, id DESC
+    LIMIT ?
+  `);
+
+  const countStmt = db.prepare(`SELECT COUNT(*) AS n FROM health_summary_snapshots`);
+
+  function parseSnapshotRow(row) {
+    if (!row) return null;
+    const dataRetrievedAt = Number(row.data_retrieved_at);
+    if (!Number.isFinite(dataRetrievedAt)) return null;
+    const summaryRows = parseJsonArray(row.summary_rows_json);
+    const fleetTotals = parseJsonObject(row.fleet_totals_json);
+    if (!summaryRows || !summaryRows.every(isTagHealthSummaryRow)) return null;
+    if (!isFleetHealthTotals(fleetTotals)) return null;
+    return {
+      id: Number(row.id),
+      dataRetrievedAt,
+      fleetTotals,
+      summaryRows,
+      storedAt: Number(row.created_at),
+    };
+  }
 
   return {
     /**
@@ -95,26 +121,26 @@ export function openHealthSummaryDb(dbPath) {
     },
 
     getLatestSnapshot() {
-      const row = selectLatestStmt.get();
-      if (!row) return null;
+      return parseSnapshotRow(selectLatestStmt.get());
+    },
 
-      const dataRetrievedAt = Number(row.data_retrieved_at);
-      if (!Number.isFinite(dataRetrievedAt)) return null;
+    /** @param {number} [limit] */
+    listSnapshots(limit = 30) {
+      const n = Math.max(1, Math.min(120, Number(limit) || 30));
+      return selectListStmt.all(n).map(parseSnapshotRow).filter(Boolean);
+    },
 
-      const summaryRows = parseJsonArray(row.summary_rows_json);
-      const fleetTotals = parseJsonObject(row.fleet_totals_json);
-      if (!summaryRows || !summaryRows.every(isTagHealthSummaryRow)) return null;
-      if (!isFleetHealthTotals(fleetTotals)) return null;
+    getSnapshotCount() {
+      const row = countStmt.get();
+      return row ? Number(row.n) : 0;
+    },
 
-      return {
-        dataRetrievedAt,
-        fleetTotals,
-        summaryRows,
-        storedAt: Number(row.created_at),
-      };
+    checkpoint() {
+      checkpointSqliteDb(db);
     },
 
     close() {
+      checkpointSqliteDb(db);
       db.close();
     },
   };

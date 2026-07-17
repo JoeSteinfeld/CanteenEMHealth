@@ -23,8 +23,6 @@ export function recoverStaleWalSidecars(dbPath) {
  * @param {(db: import("better-sqlite3").Database) => void} initSchema
  */
 export function openSqliteDb(dbPath, initSchema) {
-  recoverStaleWalSidecars(dbPath);
-
   let db;
   try {
     db = new Database(dbPath);
@@ -48,5 +46,14 @@ export function openSqliteDb(dbPath, initSchema) {
       return db;
     }
     throw err;
+  }
+}
+
+/** Flush WAL pages into the main database file (important before shutdown on synced folders). */
+export function checkpointSqliteDb(db) {
+  try {
+    db.pragma("wal_checkpoint(TRUNCATE)");
+  } catch {
+    /* ignore — best effort */
   }
 }

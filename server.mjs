@@ -15,6 +15,11 @@ import {
 } from "./auth.mjs";
 import { MAX_NOTE_LENGTH, openSensorNotesDb } from "./notes-db.mjs";
 import { openHealthSummaryDb } from "./health-summary-db.mjs";
+import { buildHealthSummaryTrends } from "./health-summary-trends.mjs";
+import {
+  getHealthSummaryScheduleInfo,
+  startDailyHealthSummaryScheduler,
+} from "./health-summary-scheduler.mjs";
 import {
   EM_WIDGET_READING_IDS,
   hasEmWidgetReadings,
@@ -515,7 +520,6 @@ app.get("/api/tags", async (_req, res) => {
 
 /** Per-tag connectivity summary; aggregates on the server (one tags fetch + parallel readings). */
 app.get("/api/health-summary/snapshot", (_req, res) => {
-  if (!requireToken(res)) return;
   try {
     const snapshot = healthSummaryStore.getLatestSnapshot();
     if (!snapshot) {
@@ -534,45 +538,119 @@ app.get("/api/health-summary/snapshot", (_req, res) => {
   }
 });
 
+/** Restore a snapshot from browser cache when SQLite is empty (e.g. after WAL loss on Google Drive). */
+app.post("/api/health-summary/snapshot", (req, res) => {
+  try {
+    const dataRetrievedAt = Number(req.body?.dataRetrievedAt);
+    const fleetTotals = req.body?.fleetTotals;
+    const summaryRows = req.body?.summaryRows;
+    if (!Number.isFinite(dataRetrievedAt)) {
+      return res.status(400).json({ error: "Invalid dataRetrievedAt" });
+    }
+    if (!Array.isArray(summaryRows)) {
+      return res.status(400).json({ error: "summaryRows must be an array" });
+    }
+    if (
+      !fleetTotals ||
+      typeof fleetTotals !== "object" ||
+      typeof fleetTotals.totalSensors !== "number" ||
+      typeof fleetTotals.connectedLast7Days !== "number" ||
+      typeof fleetTotals.neverConnected !== "number" ||
+      typeof fleetTotals.notConnected7Days !== "number" ||
+      typeof fleetTotals.pctHealthy !== "number"
+    ) {
+      return res.status(400).json({ error: "Invalid fleetTotals" });
+    }
+    const latest = healthSummaryStore.getLatestSnapshot();
+    if (latest && latest.dataRetrievedAt >= dataRetrievedAt) {
+      return res.json({ restored: false, reason: "server_already_has_newer_snapshot" });
+    }
+    healthSummaryStore.saveSnapshot({ dataRetrievedAt, fleetTotals, summaryRows });
+    healthSummaryStore.checkpoint();
+    res.json({ restored: true, dataRetrievedAt });
+  } catch (e) {
+    res.status(500).json({
+      error: e instanceof Error ? e.message : "Failed to restore health summary snapshot",
+    });
+  }
+});
+
+/** Org/tag trends from saved snapshot history (comparison + time series). */
+app.get("/api/health-summary/trends", (req, res) => {
+  try {
+    const modeRaw = req.query.mode != null ? String(req.query.mode).trim() : String(req.query.baseline ?? "baseline").trim();
+    const mode = modeRaw === "dates" ? "dates" : "baseline";
+    const startDate = req.query.startDate != null ? String(req.query.startDate).trim() : null;
+    const endDate = req.query.endDate != null ? String(req.query.endDate).trim() : null;
+    const historyLimit = req.query.historyLimit != null ? Number(req.query.historyLimit) : 14;
+    const snapshots = healthSummaryStore.listSnapshots(120);
+    const trends = buildHealthSummaryTrends(snapshots, { mode, startDate, endDate, historyLimit });
+    res.json(trends);
+  } catch (e) {
+    res.status(500).json({
+      error: e instanceof Error ? e.message : "Failed to load health summary trends",
+    });
+  }
+});
+
+/** Per-tag connectivity summary; aggregates on the server (one tags fetch + parallel readings). */
+async function fetchAndSaveHealthSummary() {
+  const retrievedAt = Date.now();
+  const tagRows = await paginateList("/tags", new URLSearchParams({ limit: "512" }));
+  const sensorIds = uniqueSensorIdsFromTagRows(tagRows);
+  if (sensorIds.length === 0) {
+    const payload = {
+      dataRetrievedAt: retrievedAt,
+      data: [],
+      fleetTotals: {
+        totalSensors: 0,
+        connectedLast7Days: 0,
+        neverConnected: 0,
+        notConnected7Days: 0,
+        pctHealthy: 0,
+      },
+    };
+    healthSummaryStore.saveSnapshot({
+      dataRetrievedAt: retrievedAt,
+      fleetTotals: payload.fleetTotals,
+      summaryRows: payload.data,
+    });
+    healthSummaryStore.checkpoint();
+    return payload;
+  }
+
+  const readingRows = await fetchReadingsSnapshotBatched(sensorIds);
+  const readingsByEntity = indexReadingsByEntity(readingRows);
+  const data = buildTagHealthSummaryFromTagRows(tagRows, readingsByEntity, retrievedAt);
+  const fleetTotals = buildFleetHealthTotals(tagRows, readingsByEntity, retrievedAt);
+
+  healthSummaryStore.saveSnapshot({
+    dataRetrievedAt: retrievedAt,
+    fleetTotals,
+    summaryRows: data,
+  });
+  healthSummaryStore.checkpoint();
+
+  return { dataRetrievedAt: retrievedAt, data, fleetTotals };
+}
+
+/** Schedule info for daily 12:00 AM Eastern snapshots (Health Summary / Trends banners). */
+app.get("/api/health-summary/schedule", (_req, res) => {
+  try {
+    res.json(getHealthSummaryScheduleInfo(healthSummaryStore));
+  } catch (e) {
+    res.status(500).json({
+      error: e instanceof Error ? e.message : "Failed to load health summary schedule",
+    });
+  }
+});
+
 /** Per-tag connectivity summary; aggregates on the server (one tags fetch + parallel readings). */
 app.get("/api/health-summary", async (_req, res) => {
   if (!requireToken(res)) return;
   try {
-    const retrievedAt = Date.now();
-    const tagRows = await paginateList("/tags", new URLSearchParams({ limit: "512" }));
-    const sensorIds = uniqueSensorIdsFromTagRows(tagRows);
-    if (sensorIds.length === 0) {
-      const payload = {
-        dataRetrievedAt: retrievedAt,
-        data: [],
-        fleetTotals: {
-          totalSensors: 0,
-          connectedLast7Days: 0,
-          neverConnected: 0,
-          notConnected7Days: 0,
-          pctHealthy: 0,
-        },
-      };
-      healthSummaryStore.saveSnapshot({
-        dataRetrievedAt: retrievedAt,
-        fleetTotals: payload.fleetTotals,
-        summaryRows: payload.data,
-      });
-      return res.json(payload);
-    }
-
-    const readingRows = await fetchReadingsSnapshotBatched(sensorIds);
-    const readingsByEntity = indexReadingsByEntity(readingRows);
-    const data = buildTagHealthSummaryFromTagRows(tagRows, readingsByEntity, retrievedAt);
-    const fleetTotals = buildFleetHealthTotals(tagRows, readingsByEntity, retrievedAt);
-
-    healthSummaryStore.saveSnapshot({
-      dataRetrievedAt: retrievedAt,
-      fleetTotals,
-      summaryRows: data,
-    });
-
-    res.json({ dataRetrievedAt: retrievedAt, data, fleetTotals });
+    const payload = await fetchAndSaveHealthSummary();
+    res.json(payload);
   } catch (e) {
     res.status(e.status || 500).json({
       error: e.message,
@@ -779,6 +857,16 @@ const server = app.listen(PORT, () => {
   console.log(`Samsara proxy on http://127.0.0.1:${PORT} → ${BASE}`);
   console.log(`Sensor notes DB: ${NOTES_DB_PATH}`);
   console.log(`Access audit DB: ${AUDIT_DB_PATH}`);
+  console.log(`Health summary DB: ${HEALTH_SUMMARY_DB_PATH}`);
+  const snapshotCount = healthSummaryStore.getSnapshotCount();
+  const latest = healthSummaryStore.getLatestSnapshot();
+  if (latest) {
+    console.log(
+      `Health summary snapshots: ${snapshotCount} (latest ${new Date(latest.dataRetrievedAt).toISOString()})`,
+    );
+  } else {
+    console.log("Health summary snapshots: none saved yet — daily 12:00 AM Eastern job or Refresh will save one.");
+  }
   if (isAuthEnabled()) {
     console.log("Site login: enabled (SITE_PASSWORD is set)");
   } else {
@@ -786,6 +874,45 @@ const server = app.listen(PORT, () => {
   }
   if (!TOKEN) console.warn("SAMSARA_API_TOKEN is not set. Add it to .env to load data.\n");
 });
+
+const dailyHealthSummaryScheduler = startDailyHealthSummaryScheduler({
+  hasToken: () => Boolean(TOKEN),
+  runSnapshot: () => fetchAndSaveHealthSummary(),
+  getLatestSnapshot: () => healthSummaryStore.getLatestSnapshot(),
+});
+
+function shutdownDatabases() {
+  try {
+    dailyHealthSummaryScheduler.stop();
+  } catch {
+    /* ignore */
+  }
+  try {
+    healthSummaryStore.close();
+  } catch {
+    /* ignore */
+  }
+  try {
+    notesStore.close();
+  } catch {
+    /* ignore */
+  }
+  try {
+    auditLog.close();
+  } catch {
+    /* ignore */
+  }
+}
+
+function shutdown(signal) {
+  console.log(`\n${signal} received — checkpointing databases…`);
+  shutdownDatabases();
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 3000).unref();
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 server.on("error", (err) => {
   if (err && "code" in err && err.code === "EADDRINUSE") {
