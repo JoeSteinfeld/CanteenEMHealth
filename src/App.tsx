@@ -9,6 +9,14 @@ import { Login } from "./Login";
 import { TrendsCacheProvider } from "./trendsCache";
 import { Trends } from "./Trends";
 import {
+  ColumnPicker,
+  defaultColumnPrefs,
+  normalizeColumnPrefs,
+  visibleColumnsInOrder,
+  type ColumnPrefs,
+} from "./ColumnPicker";
+import { SensorApiInfoDialog } from "./SensorApiInfoDialog";
+import {
   categorizeSensorHealth,
   isBatteryVoltageLowIndicated,
   isLastConnectedStale,
@@ -56,19 +64,74 @@ const TABLE_COLUMNS = [
   { key: "id" as const, label: "ID" },
   { key: "name" as const, label: "Name" },
   { key: "lastConnectedTime" as const, label: "Last connected time" },
+  { key: "connectedTo" as const, label: "Last Connected To" },
   { key: "batteryVoltageLow" as const, label: "Battery voltage level" },
   { key: "batteryVoltage" as const, label: "Battery voltage" },
   { key: "temperature" as const, label: "Temperature" },
+  { key: "tempMax30d" as const, label: "Max temp" },
+  { key: "tempMin30d" as const, label: "Min temp" },
+  { key: "tempAvg30d" as const, label: "Avg temp" },
   { key: "action" as const, label: "Action" },
   { key: "note" as const, label: "Notes" },
 ] as const;
 
 type TableColumnKey = (typeof TABLE_COLUMNS)[number]["key"];
 
+/** Leaf columns under the "Temperature (30d)" group header. */
+const TEMP_30D_GROUP_KEYS = new Set<TableColumnKey>(["tempMax30d", "tempMin30d", "tempAvg30d"]);
+
+type GroupHeaderCell =
+  | { kind: "empty"; key: string; colSpan: 1 }
+  | { kind: "group"; key: string; colSpan: number; label: string };
+
+/** Build group-header cells for the current visible column order (contiguous temp-30d runs span). */
+function buildTemp30dGroupHeaderCells(visible: { key: TableColumnKey }[]): GroupHeaderCell[] {
+  const cells: GroupHeaderCell[] = [];
+  let i = 0;
+  while (i < visible.length) {
+    const col = visible[i];
+    if (TEMP_30D_GROUP_KEYS.has(col.key)) {
+      let colSpan = 0;
+      const start = i;
+      while (i < visible.length && TEMP_30D_GROUP_KEYS.has(visible[i].key)) {
+        colSpan += 1;
+        i += 1;
+      }
+      cells.push({ kind: "group", key: `temp30d-group-${start}`, colSpan, label: "Temperature (30d)" });
+    } else {
+      cells.push({ kind: "empty", key: `group-pad-${col.key}`, colSpan: 1 });
+      i += 1;
+    }
+  }
+  return cells;
+}
+
+/** Always visible; checkbox disabled in the Columns picker (like Samsara Name). */
+const LOCKED_TABLE_COLUMNS: readonly TableColumnKey[] = ["name"];
+
+const COLUMN_PREFS_STORAGE_KEY = "canteen-em-detailed-sensor-columns-v1";
+
 function emptyColumnSearch(): Record<TableColumnKey, string> {
   const o = {} as Record<TableColumnKey, string>;
   for (const c of TABLE_COLUMNS) o[c.key] = "";
   return o;
+}
+
+function loadColumnPrefs(): ColumnPrefs<TableColumnKey> {
+  try {
+    const raw = localStorage.getItem(COLUMN_PREFS_STORAGE_KEY);
+    return normalizeColumnPrefs(TABLE_COLUMNS, LOCKED_TABLE_COLUMNS, raw ? JSON.parse(raw) : null);
+  } catch {
+    return defaultColumnPrefs(TABLE_COLUMNS, LOCKED_TABLE_COLUMNS);
+  }
+}
+
+function saveColumnPrefs(prefs: ColumnPrefs<TableColumnKey>) {
+  try {
+    localStorage.setItem(COLUMN_PREFS_STORAGE_KEY, JSON.stringify(prefs));
+  } catch {
+    /* ignore quota / private mode */
+  }
 }
 
 /** Window length for fleet/environment deep links (seconds). */
@@ -209,13 +272,25 @@ function formatHoverDateTime(iso: string): string {
 
 /**
  * Acceptable °F bands by sensor name (case-insensitive). Freezer checked before Cooler.
- * Spec: Freezer &gt; −25 and &lt; 25; Cooler &gt; 32 and &lt; 50 — band drawn on [lo, hi] for visibility.
+ * Spec: Freezer −15 to 0°F; Cooler 32 to 45°F — band drawn on [lo, hi] for visibility.
  */
 function acceptableTempRangeForSensorName(sensorName: string): { lo: number; hi: number; kind: "freezer" | "cooler" } | null {
   const n = sensorName.trim().toLowerCase();
-  if (n.includes("freezer")) return { lo: -25, hi: 25, kind: "freezer" };
-  if (n.includes("cooler")) return { lo: 32, hi: 50, kind: "cooler" };
+  if (n.includes("freezer")) return { lo: -15, hi: 0, kind: "freezer" };
+  if (n.includes("cooler")) return { lo: 32, hi: 45, kind: "cooler" };
   return null;
+}
+
+/** Whether 30d avg (°F display) is inside the cooler/freezer band for this sensor name. */
+function avgTemp30dRangeStatus(
+  sensorName: string,
+  avgDisplay: string,
+): "in" | "out" | null {
+  const range = acceptableTempRangeForSensorName(sensorName);
+  if (!range) return null;
+  const avg = parseDisplayNumber(avgDisplay);
+  if (avg == null) return null;
+  return avg >= range.lo && avg <= range.hi ? "in" : "out";
 }
 
 /** Parse `<input type="time">` value (`HH:MM` or `HH:MM:SS`) to minutes since midnight. */
@@ -611,8 +686,8 @@ function TemperatureHistoryModal({
             <p className="temp-history-legend" role="note">
               <span className="temp-history-legend-swatch" aria-hidden />
               <span>
-                Green band = acceptable range by name: <strong>Freezer</strong> (−25°F to 25°F) ·{" "}
-                <strong>Cooler</strong> (32°F to 50°F).
+                Green band = acceptable range by name: <strong>Freezer</strong> (−15°F to 0°F) ·{" "}
+                <strong>Cooler</strong> (32°F to 45°F).
               </span>
             </p>
             <p className="temp-history-sub muted">
@@ -817,11 +892,17 @@ function Dashboard() {
   const [healthCategoryFilters, setHealthCategoryFilters] = useState<Set<HealthCategory>>(new Set());
   /** Per-column substring filters (AND). */
   const [columnSearch, setColumnSearch] = useState<Record<TableColumnKey, string>>(emptyColumnSearch());
+  /** Visible columns + order for the detailed sensor table. */
+  const [columnPrefs, setColumnPrefs] = useState<ColumnPrefs<TableColumnKey>>(loadColumnPrefs);
   /** From GET /api/org-id → Samsara GET /me; used for cloud deep links on sensor names. */
   const [samsaraOrgId, setSamsaraOrgId] = useState<string | null>(null);
   /** Row for which the temperature history modal is open (on-demand /readings/history). */
   const [tempHistoryRow, setTempHistoryRow] = useState<{ id: string; name: string } | null>(null);
+  /** True while 30-day max/min/avg temperature stats are loading in the background. */
+  const [loadingTempStats, setLoadingTempStats] = useState(false);
+  const [sensorApiInfoOpen, setSensorApiInfoOpen] = useState(false);
   const deepLinkHandledRef = useRef<string | null>(null);
+  const tempStatsAbortRef = useRef<AbortController | null>(null);
 
   const loadTags = useCallback(async () => {
     setLoadingTags(true);
@@ -889,7 +970,12 @@ function Dashboard() {
   };
 
   const loadRecordsForTagIds = useCallback(async (tagIds: Set<string>) => {
+    tempStatsAbortRef.current?.abort();
+    const statsAbort = new AbortController();
+    tempStatsAbortRef.current = statsAbort;
+
     setLoadingData(true);
+    setLoadingTempStats(false);
     setDataError(null);
     setRows(null);
     setDataRetrievedAt(null);
@@ -903,12 +989,76 @@ function Dashboard() {
         throw new Error(msg || r.statusText);
       }
       const retrievedAt = Date.now();
-      setRows(Array.isArray(j.data) ? (j.data as Row[]) : []);
+      const list = Array.isArray(j.data) ? (j.data as Row[]) : [];
+      const normalized = list.map((row) => ({
+        ...row,
+        connectedTo: typeof row.connectedTo === "string" && row.connectedTo.trim() !== "" ? row.connectedTo : "—",
+        note: typeof row.note === "string" ? row.note : "",
+        tempMax30d: "…",
+        tempMin30d: "…",
+        tempAvg30d: "…",
+      }));
+      setRows(normalized);
       setDataRetrievedAt(retrievedAt);
+      setLoadingData(false);
+
+      if (normalized.length === 0) return;
+
+      setLoadingTempStats(true);
+      try {
+        const sr = await apiFetch("/api/sensor-temperature-stats", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sensorIds: normalized.map((row) => row.id) }),
+          signal: statsAbort.signal,
+        });
+        const sj: {
+          data?: Record<string, { max?: string; min?: string; avg?: string } | null>;
+          error?: string;
+          hint?: string;
+        } = await parseJsonSafe(sr);
+        if (statsAbort.signal.aborted) return;
+        if (!sr.ok) {
+          const msg = [sj.error, sj.hint].filter(Boolean).join(" — ");
+          throw new Error(msg || sr.statusText);
+        }
+        const byId = sj.data && typeof sj.data === "object" ? sj.data : {};
+        setRows((prev) =>
+          prev
+            ? prev.map((row) => {
+                const stats = byId[row.id];
+                if (!stats) {
+                  return { ...row, tempMax30d: "—", tempMin30d: "—", tempAvg30d: "—" };
+                }
+                return {
+                  ...row,
+                  tempMax30d: typeof stats.max === "string" ? stats.max : "—",
+                  tempMin30d: typeof stats.min === "string" ? stats.min : "—",
+                  tempAvg30d: typeof stats.avg === "string" ? stats.avg : "—",
+                };
+              })
+            : prev,
+        );
+      } catch (e) {
+        if (statsAbort.signal.aborted) return;
+        setRows((prev) =>
+          prev
+            ? prev.map((row) => ({
+                ...row,
+                tempMax30d: row.tempMax30d === "…" ? "—" : row.tempMax30d,
+                tempMin30d: row.tempMin30d === "…" ? "—" : row.tempMin30d,
+                tempAvg30d: row.tempAvg30d === "…" ? "—" : row.tempAvg30d,
+              }))
+            : prev,
+        );
+        console.warn("30-day temperature stats failed:", e instanceof Error ? e.message : e);
+      } finally {
+        if (!statsAbort.signal.aborted) setLoadingTempStats(false);
+      }
     } catch (e) {
       setDataError(e instanceof Error ? e.message : "Request failed");
-    } finally {
       setLoadingData(false);
+      setLoadingTempStats(false);
     }
   }, []);
 
@@ -984,9 +1134,20 @@ function Dashboard() {
     setRows((prev) => (prev ? prev.map((r) => (r.id === sensorId ? { ...r, note } : r)) : prev));
   }, []);
 
+  const visibleTableColumns = useMemo(
+    () => visibleColumnsInOrder(TABLE_COLUMNS, columnPrefs),
+    [columnPrefs],
+  );
+
+  const applyColumnPrefs = useCallback((next: ColumnPrefs<TableColumnKey>) => {
+    const normalized = normalizeColumnPrefs(TABLE_COLUMNS, LOCKED_TABLE_COLUMNS, next);
+    setColumnPrefs(normalized);
+    saveColumnPrefs(normalized);
+  }, []);
+
   const exportCsv = useCallback(() => {
     if (!displayRows?.length) return;
-    const text = buildEmSensorExportCsv(displayRows, dataRetrievedAt);
+    const text = buildEmSensorExportCsv(displayRows, dataRetrievedAt, visibleTableColumns);
     const blob = new Blob([`\uFEFF${text}`], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -994,7 +1155,7 @@ function Dashboard() {
     a.download = `em-sensor-health-${fileStampForExport()}.csv`;
     a.click();
     URL.revokeObjectURL(url);
-  }, [displayRows, dataRetrievedAt]);
+  }, [displayRows, dataRetrievedAt, visibleTableColumns]);
 
   const tagSelectSummary = useMemo(() => {
     if (loadingTags) return "Loading tags…";
@@ -1084,12 +1245,18 @@ function Dashboard() {
     <div className="app">
       <header className="header">
         <h1>Detailed Sensor Health</h1>
+        <p className="header-api-link-row">
+          <button
+            type="button"
+            className="linkish sensor-api-info-link"
+            onClick={() => setSensorApiInfoOpen(true)}
+          >
+            Sensor API Information
+          </button>
+        </p>
         <p className="lede">
-          Sensors come from each tag’s <code>sensors</code> list on <strong>List tags</strong> (
-          <code>GET /tags</code>), limited to EM environment monitors (deactivated placeholders and non-EM devices on tags are excluded). Readings use the <strong>Get Readings Snapshot</strong> API (
-          <code>GET /readings/latest</code> with <code>entityType=sensor</code>) for widget and environmental
-          monitor fields. Click a <strong>temperature</strong> value to load a 30-day chart from{" "}
-          <code>GET /readings/history</code> for that sensor only.
+          EM environment monitors from each tag’s <code>sensors</code> list on <code>GET /tags</code>. Load sensor data
+          to query readings and GetTemperature. Click a temperature value for a 30-day chart.
         </p>
       </header>
 
@@ -1266,41 +1433,74 @@ function Dashboard() {
       </section>
 
       <section className="table-wrap">
-        {rows && (
-          <div className="summary summary-with-actions">
-            <span>
-              {healthCategoryFilters.size === 0 && !hasColumnSearch(columnSearch) ? (
-                <>
-                  {rows.length} sensor{rows.length === 1 ? "" : "s"}
-                </>
-              ) : displayRows == null ? (
-                <>
-                  {rows.length} sensor{rows.length === 1 ? "" : "s"}
-                </>
-              ) : displayRows.length === 0 ? (
-                <>No sensors match the current filters ({rows.length} loaded)</>
-              ) : displayRows.length === rows.length ? (
-                <>
-                  {rows.length} sensor{rows.length === 1 ? "" : "s"} (all match filters)
-                </>
-              ) : (
-                <>
-                  {displayRows.length} of {rows.length} sensor{rows.length === 1 ? "" : "s"} (filtered)
-                </>
-              )}
-            </span>
+        <div className="summary summary-with-actions">
+          <span>
+            {rows == null ? (
+              <>Load sensor data to populate the table</>
+            ) : healthCategoryFilters.size === 0 && !hasColumnSearch(columnSearch) ? (
+              <>
+                {rows.length} sensor{rows.length === 1 ? "" : "s"}
+              </>
+            ) : displayRows == null ? (
+              <>
+                {rows.length} sensor{rows.length === 1 ? "" : "s"}
+              </>
+            ) : displayRows.length === 0 ? (
+              <>No sensors match the current filters ({rows.length} loaded)</>
+            ) : displayRows.length === rows.length ? (
+              <>
+                {rows.length} sensor{rows.length === 1 ? "" : "s"} (all match filters)
+              </>
+            ) : (
+              <>
+                {displayRows.length} of {rows.length} sensor{rows.length === 1 ? "" : "s"} (filtered)
+              </>
+            )}
+          </span>
+          <div className="summary-table-actions">
             {hasColumnSearch(columnSearch) && (
               <button type="button" className="linkish" onClick={() => setColumnSearch(emptyColumnSearch())}>
                 Clear column search
               </button>
             )}
+            <ColumnPicker
+              columns={TABLE_COLUMNS}
+              prefs={columnPrefs}
+              lockedKeys={LOCKED_TABLE_COLUMNS}
+              onApply={applyColumnPrefs}
+            />
           </div>
-        )}
+        </div>
         <div className="scroll">
-          <table className="grid">
+          <table className={`grid${loadingTempStats ? " grid-temp30d-loading" : ""}`}>
             <thead>
+              {visibleTableColumns.some((c) => TEMP_30D_GROUP_KEYS.has(c.key)) && (
+                <tr className="th-group-row">
+                  {buildTemp30dGroupHeaderCells(visibleTableColumns).map((cell) =>
+                    cell.kind === "group" ? (
+                      <th
+                        key={cell.key}
+                        className="th-group th-group-temp30d"
+                        colSpan={cell.colSpan}
+                        scope="colgroup"
+                      >
+                        <div className="th-group-temp30d-inner">
+                          <span className="th-group-temp30d-label">{cell.label}</span>
+                          {loadingTempStats && (
+                            <span className="temp30d-loading" aria-live="polite">
+                              Loading 30-day temp stats…
+                            </span>
+                          )}
+                        </div>
+                      </th>
+                    ) : (
+                      <th key={cell.key} className="th-group th-group-empty" scope="col" aria-hidden />
+                    ),
+                  )}
+                </tr>
+              )}
               <tr className="th-filter-row">
-                {TABLE_COLUMNS.map(({ key, label }) => (
+                {visibleTableColumns.map(({ key, label }) => (
                   <th key={`filter-${key}`} className="th-filter" scope="col">
                     <label className="col-filter-label" htmlFor={`col-filter-${key}`}>
                       Search {label}
@@ -1310,10 +1510,18 @@ function Dashboard() {
                       type="search"
                       className="col-filter-input"
                       placeholder={
-                        key === "temperature" ? ">72, <40, =68 (°F)" : "Search…"
+                        key === "temperature" ||
+                        key === "tempMax30d" ||
+                        key === "tempMin30d" ||
+                        key === "tempAvg30d"
+                          ? ">72, <40, =68 (°F)"
+                          : "Search…"
                       }
                       title={
-                        key === "temperature"
+                        key === "temperature" ||
+                        key === "tempMax30d" ||
+                        key === "tempMin30d" ||
+                        key === "tempAvg30d"
                           ? "Compare in °F: greater than (e.g. >72), less than (e.g. <40), or equal (e.g. =68). Other text matches as a normal search."
                           : undefined
                       }
@@ -1322,8 +1530,11 @@ function Dashboard() {
                         setColumnSearch((prev) => ({ ...prev, [key]: e.target.value }))
                       }
                       aria-label={
-                        key === "temperature"
-                          ? "Filter by temperature in degrees Fahrenheit: use greater than, less than, or equals with a number, or plain text to search the cell"
+                        key === "temperature" ||
+                        key === "tempMax30d" ||
+                        key === "tempMin30d" ||
+                        key === "tempAvg30d"
+                          ? `Filter by ${label} in degrees Fahrenheit: use greater than, less than, or equals with a number, or plain text to search the cell`
                           : `Filter by ${label}`
                       }
                     />
@@ -1331,7 +1542,7 @@ function Dashboard() {
                 ))}
               </tr>
               <tr className="th-sort-row">
-                {TABLE_COLUMNS.map(({ key, label }) => {
+                {visibleTableColumns.map(({ key, label }) => {
                   const batteryVoltageHeaderTitle =
                     key === "batteryVoltageLow" || key === "batteryVoltage"
                       ? "Battery Voltage >1.5 Volts means battery is healthy and < 1.5 volts that battery is low and needs to be replaced"
@@ -1355,7 +1566,7 @@ function Dashboard() {
             <tbody>
               {rows === null && (
                 <tr>
-                  <td colSpan={9} className="muted">
+                  <td colSpan={Math.max(visibleTableColumns.length, 1)} className="muted">
                     Run <strong>Load sensor data</strong> to query Samsara.
                   </td>
                 </tr>
@@ -1363,7 +1574,7 @@ function Dashboard() {
               {rows &&
                 rows.length === 0 && (
                   <tr>
-                    <td colSpan={9} className="muted">
+                    <td colSpan={Math.max(visibleTableColumns.length, 1)} className="muted">
                       No sensors for the current tag filter, or tag payloads have no <code>sensors</code> list.
                     </td>
                   </tr>
@@ -1372,7 +1583,6 @@ function Dashboard() {
                 displayRows.map((r) => {
                   const missingLast = isMissingLastConnected(r.lastConnectedTime);
                   const stale = isLastConnectedStale(r.lastConnectedTime, dataRetrievedAt);
-                  const action = getSensorAction(r, dataRetrievedAt);
                   const recentLowBattery =
                     !missingLast &&
                     !stale &&
@@ -1399,56 +1609,47 @@ function Dashboard() {
                             : undefined
                     }
                   >
-                    <td className="tags-cell">{r.tagValue}</td>
-                    <td className="mono">
-                      {samsaraOrgId != null && r.name.trim() !== "" ? (
-                        <a
-                          className="sensor-cloud-link"
-                          href={buildSamsaraSensorConfigSensorsUrl(samsaraOrgId, r.name)}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          title="Open sensor configuration in Samsara Cloud (search by name)"
-                        >
-                          {r.id}
-                        </a>
-                      ) : (
-                        r.id
-                      )}
-                    </td>
-                    <td>
-                      {samsaraOrgId != null && r.name.trim() !== "" ? (
-                        <a
-                          className="sensor-cloud-link"
-                          href={buildSamsaraSensorEnvironmentUrl(samsaraOrgId, r.name)}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          title="Open this sensor in Samsara Cloud (Environment, last 30 days)"
-                        >
-                          {r.name}
-                        </a>
-                      ) : (
-                        r.name
-                      )}
-                    </td>
-                    <td className="mono">
-                      {missingLast ? "—" : formatTime(r.lastConnectedTime as string)}
-                    </td>
-                    <td>{r.batteryVoltageLow}</td>
-                    <td className="mono">{r.batteryVoltage}</td>
-                    <td className="mono">
-                      <button
-                        type="button"
-                        className="linkish temp-history-btn"
-                        onClick={() => setTempHistoryRow({ id: r.id, name: r.name })}
-                        title="Open 30-day temperature history for this sensor"
-                      >
-                        {r.temperature}
-                      </button>
-                    </td>
-                    <td>{action || "—"}</td>
-                    <td className="notes-cell">
-                      <SensorNoteField sensorId={r.id} value={r.note} onPersisted={handleNotePersisted} />
-                    </td>
+                    {visibleTableColumns.map(({ key }) => {
+                      const avgStatus =
+                        key === "tempAvg30d" ? avgTemp30dRangeStatus(r.name, r.tempAvg30d) : null;
+                      const className = [
+                        key === "tagValue"
+                          ? "tags-cell"
+                          : key === "id" ||
+                              key === "lastConnectedTime" ||
+                              key === "batteryVoltage" ||
+                              key === "temperature" ||
+                              key === "tempMax30d" ||
+                              key === "tempMin30d" ||
+                              key === "tempAvg30d"
+                            ? "mono"
+                            : key === "note"
+                              ? "notes-cell"
+                              : undefined,
+                        avgStatus === "in" ? "temp-avg-in-range" : undefined,
+                        avgStatus === "out" ? "temp-avg-out-of-range" : undefined,
+                      ]
+                        .filter(Boolean)
+                        .join(" ");
+                      const range = key === "tempAvg30d" ? acceptableTempRangeForSensorName(r.name) : null;
+                      const title =
+                        avgStatus && range
+                          ? avgStatus === "in"
+                            ? `30d avg is within ${range.kind} range (${range.lo}°F to ${range.hi}°F)`
+                            : `30d avg is outside ${range.kind} range (${range.lo}°F to ${range.hi}°F)`
+                          : undefined;
+                      return (
+                      <td key={key} className={className || undefined} title={title}>
+                        {renderSensorCell(key, r, {
+                          dataRetrievedAt,
+                          samsaraOrgId,
+                          missingLast,
+                          onOpenTempHistory: () => setTempHistoryRow({ id: r.id, name: r.name }),
+                          onNotePersisted: handleNotePersisted,
+                        })}
+                      </td>
+                      );
+                    })}
                   </tr>
                   );
                 })}
@@ -1463,6 +1664,7 @@ function Dashboard() {
         sensorName={tempHistoryRow?.name ?? ""}
         onClose={() => setTempHistoryRow(null)}
       />
+      <SensorApiInfoDialog open={sensorApiInfoOpen} onClose={() => setSensorApiInfoOpen(false)} />
     </div>
   );
 }
@@ -1493,40 +1695,125 @@ function escapeCsvField(value: string): string {
   return value;
 }
 
-function buildEmSensorExportCsv(records: Row[], dataRetrievedAt: number | null): string {
-  const headers = [
-    "Tag value",
-    "ID",
-    "Name",
-    "Last connected time",
-    "Battery voltage level",
-    "Battery voltage",
-    "Temperature",
-    "Action",
-    "Notes",
-  ];
-  const lines = [headers.map(escapeCsvField).join(",")];
+function csvCellForColumn(key: TableColumnKey, r: Row, dataRetrievedAt: number | null): string {
+  switch (key) {
+    case "tagValue":
+      return r.tagValue;
+    case "id":
+      return r.id;
+    case "name":
+      return r.name;
+    case "lastConnectedTime":
+      return isMissingLastConnected(r.lastConnectedTime) ? "—" : formatTime(r.lastConnectedTime as string);
+    case "connectedTo":
+      return r.connectedTo || "—";
+    case "batteryVoltageLow":
+      return r.batteryVoltageLow;
+    case "batteryVoltage":
+      return r.batteryVoltage;
+    case "temperature":
+      return r.temperature;
+    case "tempMax30d":
+      return r.tempMax30d;
+    case "tempMin30d":
+      return r.tempMin30d;
+    case "tempAvg30d":
+      return r.tempAvg30d;
+    case "action":
+      return getSensorAction(r, dataRetrievedAt) || "—";
+    case "note":
+      return r.note || "";
+    default:
+      return "";
+  }
+}
+
+function buildEmSensorExportCsv(
+  records: Row[],
+  dataRetrievedAt: number | null,
+  columns: { key: TableColumnKey; label: string }[],
+): string {
+  const lines = [columns.map((c) => escapeCsvField(c.label)).join(",")];
   for (const r of records) {
-    const missing = isMissingLastConnected(r.lastConnectedTime);
-    const lastCell = missing ? "—" : formatTime(r.lastConnectedTime as string);
-    const action = getSensorAction(r, dataRetrievedAt);
-    lines.push(
-      [
-        r.tagValue,
-        r.id,
-        r.name,
-        lastCell,
-        r.batteryVoltageLow,
-        r.batteryVoltage,
-        r.temperature,
-        action || "—",
-        r.note || "",
-      ]
-        .map(escapeCsvField)
-        .join(","),
-    );
+    lines.push(columns.map((c) => escapeCsvField(csvCellForColumn(c.key, r, dataRetrievedAt))).join(","));
   }
   return lines.join("\r\n");
+}
+
+function renderSensorCell(
+  key: TableColumnKey,
+  r: Row,
+  ctx: {
+    dataRetrievedAt: number | null;
+    samsaraOrgId: string | null;
+    missingLast: boolean;
+    onOpenTempHistory: () => void;
+    onNotePersisted: (sensorId: string, note: string) => void;
+  },
+): ReactNode {
+  switch (key) {
+    case "tagValue":
+      return r.tagValue;
+    case "id":
+      return ctx.samsaraOrgId != null && r.name.trim() !== "" ? (
+        <a
+          className="sensor-cloud-link"
+          href={buildSamsaraSensorConfigSensorsUrl(ctx.samsaraOrgId, r.name)}
+          target="_blank"
+          rel="noopener noreferrer"
+          title="Open sensor configuration in Samsara Cloud (search by name)"
+        >
+          {r.id}
+        </a>
+      ) : (
+        r.id
+      );
+    case "name":
+      return ctx.samsaraOrgId != null && r.name.trim() !== "" ? (
+        <a
+          className="sensor-cloud-link"
+          href={buildSamsaraSensorEnvironmentUrl(ctx.samsaraOrgId, r.name)}
+          target="_blank"
+          rel="noopener noreferrer"
+          title="Open this sensor in Samsara Cloud (Environment, last 30 days)"
+        >
+          {r.name}
+        </a>
+      ) : (
+        r.name
+      );
+    case "lastConnectedTime":
+      return ctx.missingLast ? "—" : formatTime(r.lastConnectedTime as string);
+    case "connectedTo":
+      return r.connectedTo || "—";
+    case "batteryVoltageLow":
+      return r.batteryVoltageLow;
+    case "batteryVoltage":
+      return r.batteryVoltage;
+    case "temperature":
+      return (
+        <button
+          type="button"
+          className="linkish temp-history-btn"
+          onClick={ctx.onOpenTempHistory}
+          title="Open 30-day temperature history for this sensor"
+        >
+          {r.temperature}
+        </button>
+      );
+    case "tempMax30d":
+      return r.tempMax30d;
+    case "tempMin30d":
+      return r.tempMin30d;
+    case "tempAvg30d":
+      return r.tempAvg30d;
+    case "action":
+      return getSensorAction(r, ctx.dataRetrievedAt) || "—";
+    case "note":
+      return <SensorNoteField sensorId={r.id} value={r.note} onPersisted={ctx.onNotePersisted} />;
+    default:
+      return null;
+  }
 }
 
 function fileStampForExport(d = new Date()): string {
@@ -1602,21 +1889,20 @@ const TEMPERATURE_EQUAL_EPS = 0.05;
  * Temperature filter: use `>72`, `<40`, `=68` (°F, same unit as the column).
  * Otherwise substring search on the cell text (e.g. part of "70.0°F").
  */
-function temperatureSearchMatches(r: Row, rawQuery: string): boolean {
+function temperatureFieldSearchMatches(displayValue: string, rawQuery: string): boolean {
   const trimmed = rawQuery.trim();
   if (!trimmed) return true;
 
   const m = trimmed.match(TEMPERATURE_COMPARE_RE);
   if (!m) {
-    const hay = columnSearchHaystack(r, "temperature", null).toLowerCase();
-    return hay.includes(trimmed.toLowerCase());
+    return displayValue.toLowerCase().includes(trimmed.toLowerCase());
   }
 
   const op = m[1];
   const threshold = parseFloat(m[2]);
   if (!Number.isFinite(threshold)) return false;
 
-  const val = parseDisplayNumber(r.temperature);
+  const val = parseDisplayNumber(displayValue);
   if (val == null) return false;
 
   switch (op) {
@@ -1639,8 +1925,13 @@ function rowMatchesColumnSearch(
   for (const c of TABLE_COLUMNS) {
     const q = filters[c.key].trim().toLowerCase();
     if (!q) continue;
-    if (c.key === "temperature") {
-      if (!temperatureSearchMatches(r, filters[c.key])) return false;
+    if (
+      c.key === "temperature" ||
+      c.key === "tempMax30d" ||
+      c.key === "tempMin30d" ||
+      c.key === "tempAvg30d"
+    ) {
+      if (!temperatureFieldSearchMatches(r[c.key], filters[c.key])) return false;
       continue;
     }
     const hay = columnSearchHaystack(r, c.key, dataRetrievedAt).toLowerCase();
@@ -1660,6 +1951,7 @@ function compareRows(
     case "tagValue":
     case "name":
     case "id":
+    case "connectedTo":
     case "batteryVoltageLow": {
       const c = a[key].localeCompare(b[key], undefined, { numeric: true, sensitivity: "base" });
       return mul * c;
@@ -1675,7 +1967,10 @@ function compareRows(
       return mul * (at < bt ? -1 : 1);
     }
     case "batteryVoltage":
-    case "temperature": {
+    case "temperature":
+    case "tempMax30d":
+    case "tempMin30d":
+    case "tempAvg30d": {
       const na = parseDisplayNumber(a[key]);
       const nb = parseDisplayNumber(b[key]);
       if (na != null && nb != null && na !== nb) return mul * (na < nb ? -1 : 1);

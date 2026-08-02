@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { openSqliteDb, checkpointSqliteDb } from "./sqlite-open.mjs";
+import { openSqliteDb, checkpointSqliteDb, isSqliteIoError, recoverStaleWalSidecars } from "./sqlite-open.mjs";
 
 function isTagHealthSummaryRow(value) {
   if (!value || typeof value !== "object") return false;
@@ -103,6 +103,10 @@ export function openHealthSummaryDb(dbPath) {
     };
   }
 
+  function runInsert(params) {
+    insertStmt.run(params);
+  }
+
   return {
     /**
      * @param {{ dataRetrievedAt: number, fleetTotals: object, summaryRows: object[] }} snapshot
@@ -112,12 +116,24 @@ export function openHealthSummaryDb(dbPath) {
       if (!Number.isFinite(dataRetrievedAt)) {
         throw new Error("Invalid dataRetrievedAt for health summary snapshot");
       }
-      insertStmt.run({
+      const params = {
         data_retrieved_at: dataRetrievedAt,
         fleet_totals_json: JSON.stringify(snapshot.fleetTotals),
         summary_rows_json: JSON.stringify(snapshot.summaryRows),
         created_at: Date.now(),
-      });
+      };
+      try {
+        runInsert(params);
+      } catch (e) {
+        if (!isSqliteIoError(e)) throw e;
+        recoverStaleWalSidecars(dbPath);
+        try {
+          db.pragma("wal_checkpoint(TRUNCATE)");
+        } catch {
+          /* ignore */
+        }
+        runInsert(params);
+      }
     },
 
     getLatestSnapshot() {

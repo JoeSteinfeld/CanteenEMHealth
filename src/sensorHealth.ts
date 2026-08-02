@@ -2,10 +2,17 @@ export type SensorRow = {
   id: string;
   name: string;
   tagValue: string;
+  /** From GetTemperature ambientTemperatureTime; null if never reported */
   lastConnectedTime: string | null;
+  /** AG/VG host name from GetTemperature trailerId → assets; "—" if unknown */
+  connectedTo: string;
   batteryVoltage: string;
   batteryVoltageLow: string;
   temperature: string;
+  /** 30-day ambient BLE temp max/min/avg display (°F); "…" while loading, "—" if none */
+  tempMax30d: string;
+  tempMin30d: string;
+  tempAvg30d: string;
   note: string;
 };
 

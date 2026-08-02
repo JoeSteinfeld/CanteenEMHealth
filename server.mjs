@@ -26,6 +26,7 @@ import {
   isDeactivatedTagSensor,
   isEmHealthTagSensor,
 } from "./sensorFilter.mjs";
+import { isSqliteIoError, resolveSqliteDbPath } from "./sqlite-open.mjs";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const BASE = (process.env.SAMSARA_API_BASE ?? "https://api.samsara.com").replace(/\/$/, "");
@@ -54,10 +55,27 @@ const STALE_MS = 7 * 24 * 60 * 60 * 1000;
 /** Guard very deep pagination for one-sensor history (30 days). */
 const READINGS_HISTORY_MAX_PAGES = 500;
 
-const NOTES_DB_PATH = process.env.NOTES_DB_PATH ?? join(process.cwd(), "data", "sensor-notes.sqlite");
-const AUDIT_DB_PATH = process.env.AUDIT_DB_PATH ?? join(process.cwd(), "data", "access-audit.sqlite");
-const HEALTH_SUMMARY_DB_PATH =
-  process.env.HEALTH_SUMMARY_DB_PATH ?? join(process.cwd(), "data", "health-summary.sqlite");
+/** Parallel sensors when computing 30-day temp max/min/avg (history is per-sensor). */
+const TEMP_STATS_CONCURRENCY = Math.max(
+  1,
+  Number(process.env.SAMSARA_TEMP_STATS_CONCURRENCY ?? 4) || 4,
+);
+
+const NOTES_DB_PATH = resolveSqliteDbPath(
+  process.env.NOTES_DB_PATH,
+  "sensor-notes.sqlite",
+  join(process.cwd(), "data", "sensor-notes.sqlite"),
+);
+const AUDIT_DB_PATH = resolveSqliteDbPath(
+  process.env.AUDIT_DB_PATH,
+  "access-audit.sqlite",
+  join(process.cwd(), "data", "access-audit.sqlite"),
+);
+const HEALTH_SUMMARY_DB_PATH = resolveSqliteDbPath(
+  process.env.HEALTH_SUMMARY_DB_PATH,
+  "health-summary.sqlite",
+  join(process.cwd(), "data", "health-summary.sqlite"),
+);
 const notesStore = openSensorNotesDb(NOTES_DB_PATH);
 const auditLog = openAuditDb(AUDIT_DB_PATH);
 const healthSummaryStore = openHealthSummaryDb(HEALTH_SUMMARY_DB_PATH);
@@ -150,6 +168,114 @@ async function samsaraFetch(path, searchParams, opts) {
     throw err;
   }
   return body;
+}
+
+/**
+ * POST to Samsara (legacy endpoints like /v1/sensors/temperature).
+ * Pass a full path including /v1 when needed; uses root host (no extra pathStyle prefix).
+ */
+async function samsaraPost(path, jsonBody) {
+  const p = path.startsWith("/") ? path : `/${path}`;
+  const url = `${BASE}${p}`;
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${TOKEN}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(jsonBody ?? {}),
+  });
+  const text = await r.text();
+  let body;
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch {
+    body = { raw: text };
+  }
+  if (!r.ok) {
+    const msg = typeof body === "string" ? body : messageFromSamsaraBody(body, r.statusText);
+    const err = new Error(msg);
+    err.status = r.status;
+    err.body = body;
+    throw err;
+  }
+  return body;
+}
+
+/** Legacy GetTemperature accepts at most 40 sensor IDs per request. */
+const SENSOR_TEMPERATURE_BATCH = 40;
+
+/**
+ * From POST /v1/sensors/temperature:
+ * - connectedTo: AG/VG host name via trailerId/vehicleId → GET /assets
+ * - lastConnectedTime: ambientTemperatureTime (last report of ambient temp)
+ * Soft-fails so sensor list still loads if scope/API unavailable.
+ * @param {string[]} sensorIds
+ * @returns {Promise<{ connectedToById: Map<string, string>, lastConnectedById: Map<string, string> }>}
+ */
+async function fetchGetTemperatureMetaBySensorId(sensorIds) {
+  const connectedToById = new Map();
+  const lastConnectedById = new Map();
+  const numericIds = [];
+  for (const id of sensorIds) {
+    const n = Number(id);
+    if (Number.isFinite(n) && Number.isSafeInteger(n)) numericIds.push(n);
+  }
+  if (numericIds.length === 0) return { connectedToById, lastConnectedById };
+
+  /** @type {Map<string, string>} sensorId → trailer/host asset id */
+  const hostIdBySensor = new Map();
+  try {
+    for (let i = 0; i < numericIds.length; i += SENSOR_TEMPERATURE_BATCH) {
+      const chunk = numericIds.slice(i, i + SENSOR_TEMPERATURE_BATCH);
+      const body = await samsaraPost("/v1/sensors/temperature", { sensors: chunk });
+      const rows = Array.isArray(body?.sensors) ? body.sensors : [];
+      for (const row of rows) {
+        if (row == null || row.id == null) continue;
+        const sid = String(row.id);
+        if (row.ambientTemperatureTime != null && String(row.ambientTemperatureTime).trim() !== "") {
+          lastConnectedById.set(sid, String(row.ambientTemperatureTime));
+        }
+        if (row.trailerId == null && row.vehicleId == null) continue;
+        const hostId = row.trailerId != null ? String(row.trailerId) : String(row.vehicleId);
+        hostIdBySensor.set(sid, hostId);
+      }
+    }
+  } catch (e) {
+    console.warn(
+      "GetTemperature unavailable:",
+      e instanceof Error ? e.message : e,
+    );
+    return { connectedToById, lastConnectedById };
+  }
+
+  const uniqueHostIds = [...new Set(hostIdBySensor.values())];
+  /** @type {Map<string, string>} host asset id → name */
+  const hostNameById = new Map();
+  try {
+    for (let i = 0; i < uniqueHostIds.length; i += 50) {
+      const chunk = uniqueHostIds.slice(i, i + 50);
+      const params = new URLSearchParams();
+      params.set("ids", chunk.join(","));
+      const body = await samsaraFetch("/assets", params, { pathStyle: "root" });
+      for (const asset of extractListData(body)) {
+        if (asset?.id == null) continue;
+        const name = asset.name != null && String(asset.name).trim() !== "" ? String(asset.name) : String(asset.id);
+        hostNameById.set(String(asset.id), name);
+      }
+    }
+  } catch (e) {
+    console.warn(
+      "Connected To (assets lookup) unavailable:",
+      e instanceof Error ? e.message : e,
+    );
+  }
+
+  for (const [sensorId, hostId] of hostIdBySensor) {
+    connectedToById.set(sensorId, hostNameById.get(hostId) ?? hostId);
+  }
+  return { connectedToById, lastConnectedById };
 }
 
 async function paginateList(path, baseParams, samsaraOpts) {
@@ -269,15 +395,6 @@ function indexReadingsByEntity(readingRows) {
   return readingsByEntity;
 }
 
-function lastConnectedTimeFromMap(rmap) {
-  const t1 = rmap.get("widgetBatteryVoltage")?.happenedAtTime;
-  const t2 = rmap.get("widgetBatteryVoltageLow")?.happenedAtTime;
-  const t3 = rmap.get("environmentMonitorAmbientTemperatureBLEConnection")?.happenedAtTime;
-  const times = [t1, t2, t3].filter(Boolean);
-  if (times.length === 0) return null;
-  return times.reduce((best, t) => (new Date(t) > new Date(best) ? t : best), times[0]);
-}
-
 function connectivityCategory(lastConnectedIso, retrievedAt) {
   if (lastConnectedIso == null || String(lastConnectedIso).trim() === "") return "never";
   const t = new Date(lastConnectedIso).getTime();
@@ -298,7 +415,7 @@ function uniqueSensorIdsFromTagRows(tagRows) {
   return [...ids];
 }
 
-function buildTagHealthSummaryFromTagRows(tagRows, readingsByEntity, retrievedAt) {
+function buildTagHealthSummaryFromTagRows(tagRows, readingsByEntity, retrievedAt, lastConnectedById) {
   const rows = [];
   for (const tag of tagRows) {
     if (!tag || tag.id == null) continue;
@@ -311,8 +428,10 @@ function buildTagHealthSummaryFromTagRows(tagRows, readingsByEntity, retrievedAt
     for (const s of sensors) {
       if (!s || s.id == null || !isEmHealthTagSensor(s, readingsByEntity)) continue;
       totalSensors += 1;
-      const rmap = readingsByEntity.get(String(s.id)) || new Map();
-      const cat = connectivityCategory(lastConnectedTimeFromMap(rmap), retrievedAt);
+      const sid = String(s.id);
+      // GetTemperature ambientTemperatureTime (same as Detailed Sensor Health).
+      const lastConnected = lastConnectedById?.get(sid) ?? null;
+      const cat = connectivityCategory(lastConnected, retrievedAt);
       if (cat === "never") neverConnected += 1;
       else if (cat === "stale") notConnected7Days += 1;
       else connectedLast7Days += 1;
@@ -333,7 +452,7 @@ function buildTagHealthSummaryFromTagRows(tagRows, readingsByEntity, retrievedAt
   return rows;
 }
 
-function buildFleetHealthTotals(tagRows, readingsByEntity, retrievedAt) {
+function buildFleetHealthTotals(tagRows, readingsByEntity, retrievedAt, lastConnectedById) {
   const seen = new Set();
   let totalSensors = 0;
   let connectedLast7Days = 0;
@@ -348,8 +467,8 @@ function buildFleetHealthTotals(tagRows, readingsByEntity, retrievedAt) {
       if (seen.has(sid)) continue;
       seen.add(sid);
       totalSensors += 1;
-      const rmap = readingsByEntity.get(sid) || new Map();
-      const cat = connectivityCategory(lastConnectedTimeFromMap(rmap), retrievedAt);
+      const lastConnected = lastConnectedById?.get(sid) ?? null;
+      const cat = connectivityCategory(lastConnected, retrievedAt);
       if (cat === "never") neverConnected += 1;
       else if (cat === "stale") notConnected7Days += 1;
       else if (cat === "connected") connectedLast7Days += 1;
@@ -621,8 +740,16 @@ async function fetchAndSaveHealthSummary() {
 
   const readingRows = await fetchReadingsSnapshotBatched(sensorIds);
   const readingsByEntity = indexReadingsByEntity(readingRows);
-  const data = buildTagHealthSummaryFromTagRows(tagRows, readingsByEntity, retrievedAt);
-  const fleetTotals = buildFleetHealthTotals(tagRows, readingsByEntity, retrievedAt);
+
+  const emSensorIds = [];
+  for (const id of sensorIds) {
+    const rmap = readingsByEntity.get(String(id)) || new Map();
+    if (hasEmWidgetReadings(rmap)) emSensorIds.push(String(id));
+  }
+  const { lastConnectedById } = await fetchGetTemperatureMetaBySensorId(emSensorIds);
+
+  const data = buildTagHealthSummaryFromTagRows(tagRows, readingsByEntity, retrievedAt, lastConnectedById);
+  const fleetTotals = buildFleetHealthTotals(tagRows, readingsByEntity, retrievedAt, lastConnectedById);
 
   healthSummaryStore.saveSnapshot({
     dataRetrievedAt: retrievedAt,
@@ -652,10 +779,14 @@ app.get("/api/health-summary", async (_req, res) => {
     const payload = await fetchAndSaveHealthSummary();
     res.json(payload);
   } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    const io = isSqliteIoError(e) || /disk I\/O error/i.test(msg);
     res.status(e.status || 500).json({
-      error: e.message,
+      error: msg,
       details: e.body,
-      hint: "Confirm Read Tags and Read Readings on the API token. Tags must return a sensors list.",
+      hint: io
+        ? "SQLite could not write the health-summary database (common when the project folder is on Google Drive). Restart the server so DBs move to ~/Library/Application Support/CanteenEMHealth/, or set HEALTH_SUMMARY_DB_PATH to a local path."
+        : "Confirm Read Tags, Read Readings, and Write Sensors (GetTemperature) on the API token. Tags must return a sensors list.",
     });
   }
 });
@@ -679,12 +810,20 @@ app.get("/api/sensor-records", async (req, res) => {
     const readingRows = await fetchReadingsSnapshotBatched(sensorList.map((s) => s.id));
     const readingsByEntity = indexReadingsByEntity(readingRows);
 
+    const emSensorIds = [];
+    for (const s of sensorList) {
+      const rmap = readingsByEntity.get(s.id) || new Map();
+      if (hasEmWidgetReadings(rmap)) emSensorIds.push(s.id);
+    }
+    const { connectedToById, lastConnectedById } = await fetchGetTemperatureMetaBySensorId(emSensorIds);
+
     const records = [];
     for (const s of sensorList) {
       const id = s.id;
       const rmap = readingsByEntity.get(id) || new Map();
       if (!hasEmWidgetReadings(rmap)) continue;
-      const lastTime = lastConnectedTimeFromMap(rmap);
+      // Prefer GetTemperature ambientTemperatureTime — last time the sensor reported ambient temp.
+      const lastTime = lastConnectedById.get(id) ?? null;
 
       const wbv = rmap.get("widgetBatteryVoltage")?.value;
       const wbl = rmap.get("widgetBatteryVoltageLow")?.value;
@@ -695,6 +834,7 @@ app.get("/api/sensor-records", async (req, res) => {
         name: s.name,
         tagValue: s.tagValue,
         lastConnectedTime: lastTime,
+        connectedTo: connectedToById.get(id) ?? "—",
         batteryVoltage: formatReadingValue("widgetBatteryVoltage", wbv),
         batteryVoltageLow: formatReadingValue("widgetBatteryVoltageLow", wbl),
         temperature: formatReadingValue("environmentMonitorAmbientTemperatureBLEConnection", temp),
@@ -794,6 +934,56 @@ app.get("/api/sensor-temperature-history", async (req, res) => {
   }
 });
 
+/**
+ * Batch 30-day max/min/avg ambient temperature (°F) for many sensors.
+ * Body: { sensorIds: string[] }. Runs with limited concurrency; soft-fails per sensor.
+ */
+app.post("/api/sensor-temperature-stats", async (req, res) => {
+  if (!requireToken(res)) return;
+  const raw = req.body?.sensorIds;
+  if (!Array.isArray(raw) || raw.length === 0) {
+    res.status(400).json({ error: "Request body must include a non-empty sensorIds array" });
+    return;
+  }
+  const sensorIds = [];
+  for (const id of raw) {
+    const s = id != null ? String(id).trim() : "";
+    if (s && /^[\w-]{1,128}$/.test(s)) sensorIds.push(s);
+  }
+  if (!sensorIds.length) {
+    res.status(400).json({ error: "No valid sensorIds provided" });
+    return;
+  }
+  /** Cap one request so a full-org load stays intentional via multiple calls if needed. */
+  const capped = sensorIds.slice(0, 500);
+
+  try {
+    const byId = await fetchTempStatsBySensorId(capped);
+    const data = {};
+    for (const id of capped) {
+      const stats = byId.get(id) ?? null;
+      data[id] = stats
+        ? {
+            max: formatTempFDisplay(stats.maxF),
+            min: formatTempFDisplay(stats.minF),
+            avg: formatTempFDisplay(stats.avgF),
+            maxF: stats.maxF,
+            minF: stats.minF,
+            avgF: stats.avgF,
+            count: stats.count,
+          }
+        : null;
+    }
+    res.json({ data, readingId: TEMP_BLE_READING_ID, windowDays: 30 });
+  } catch (e) {
+    res.status(e.status || 500).json({
+      error: e.message,
+      details: e.body,
+      hint: "Requires Read Readings scope and GET /readings/history access.",
+    });
+  }
+});
+
 app.put("/api/sensor-notes/:sensorId", (req, res) => {
   try {
     const sensorId = req.params.sensorId != null ? String(req.params.sensorId).trim() : "";
@@ -842,6 +1032,67 @@ function readingCelsiusToFahrenheit(value) {
   const v = unwrapValue(value);
   if (typeof v !== "number" || !Number.isFinite(v)) return null;
   return (v * 9) / 5 + 32;
+}
+
+function formatTempFDisplay(f) {
+  if (typeof f !== "number" || !Number.isFinite(f)) return "—";
+  return `${f.toFixed(1)}°F`;
+}
+
+/**
+ * 30-day ambient BLE temperature max/min/avg for one sensor (no point payload).
+ * @returns {Promise<{ maxF: number, minF: number, avgF: number, count: number } | null>}
+ */
+async function computeTempStatsForSensor(sensorId) {
+  const endMs = Date.now();
+  const startMs = endMs - 30 * 24 * 60 * 60 * 1000;
+  const params = new URLSearchParams();
+  params.set("entityType", READINGS_ENTITY_TYPE);
+  params.set("entityIds", sensorId);
+  params.set("readingId", TEMP_BLE_READING_ID);
+  params.set("startTime", new Date(startMs).toISOString());
+  params.set("endTime", new Date(endMs).toISOString());
+
+  const rows = await paginateReadingsHistory(params);
+  let maxF = -Infinity;
+  let minF = Infinity;
+  let sum = 0;
+  let n = 0;
+  for (const row of rows) {
+    if (!row || row.entityId == null) continue;
+    if (String(row.entityId) !== sensorId) continue;
+    const f = readingCelsiusToFahrenheit(row.value);
+    if (f == null) continue;
+    maxF = Math.max(maxF, f);
+    minF = Math.min(minF, f);
+    sum += f;
+    n += 1;
+  }
+  if (n === 0) return null;
+  return { maxF, minF, avgF: sum / n, count: n };
+}
+
+/**
+ * @param {string[]} sensorIds
+ * @returns {Promise<Map<string, { maxF: number, minF: number, avgF: number, count: number } | null>>}
+ */
+async function fetchTempStatsBySensorId(sensorIds) {
+  const ids = [...new Set(sensorIds.map(String))];
+  const out = new Map();
+  for (let i = 0; i < ids.length; i += TEMP_STATS_CONCURRENCY) {
+    const wave = ids.slice(i, i + TEMP_STATS_CONCURRENCY);
+    await Promise.all(
+      wave.map(async (id) => {
+        try {
+          out.set(id, await computeTempStatsForSensor(id));
+        } catch (e) {
+          console.warn("Temp stats (30d) unavailable for sensor", id, e instanceof Error ? e.message : e);
+          out.set(id, null);
+        }
+      }),
+    );
+  }
+  return out;
 }
 
 function unwrapValue(value) {
