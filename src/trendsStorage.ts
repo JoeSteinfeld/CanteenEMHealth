@@ -13,12 +13,15 @@ export type PersistedTrends = {
 function isFleetHealthTotals(value: unknown): value is FleetHealthTotals {
   if (!value || typeof value !== "object") return false;
   const o = value as Record<string, unknown>;
+  const optionalNum = (v: unknown) => v == null || (typeof v === "number" && Number.isFinite(v));
   return (
     typeof o.totalSensors === "number" &&
     typeof o.connectedLast7Days === "number" &&
     typeof o.neverConnected === "number" &&
     typeof o.notConnected7Days === "number" &&
-    typeof o.pctHealthy === "number"
+    typeof o.pctHealthy === "number" &&
+    optionalNum(o.avgCoolerTemp30d) &&
+    optionalNum(o.avgFreezerTemp30d)
   );
 }
 

@@ -1,4 +1,4 @@
-import { formatPctHealthy, type FleetHealthTotals, type TagHealthSummaryRow } from "./sensorHealth";
+import { formatAvgTemp30d, formatPctHealthy, type FleetHealthTotals, type TagHealthSummaryRow } from "./sensorHealth";
 
 function escapeCsvField(value: string): string {
   if (value.includes('"') || value.includes(",") || value.includes("\r") || value.includes("\n")) {
@@ -44,6 +44,8 @@ export function buildHealthSummaryExportCsv(
       "Not connected in last 7 days",
       "Never connected",
       "% healthy",
+      "Avg Cooler Temp (30d) — connected in last 7 days only",
+      "Avg Freezer Temp (30d) — connected in last 7 days only",
     ]),
     csvRow([
       "Org Summary",
@@ -52,6 +54,8 @@ export function buildHealthSummaryExportCsv(
       fleetTotals.notConnected7Days,
       fleetTotals.neverConnected,
       formatPctHealthy(fleetTotals.pctHealthy),
+      formatAvgTemp30d(fleetTotals.avgCoolerTemp30d),
+      formatAvgTemp30d(fleetTotals.avgFreezerTemp30d),
     ]),
     "",
     csvRow(["Tag Summary"]),
@@ -62,6 +66,8 @@ export function buildHealthSummaryExportCsv(
       "Not connected 7 days",
       "Never connected",
       "% healthy",
+      "Avg Cooler Temp (30d) — connected in last 7 days only",
+      "Avg Freezer Temp (30d) — connected in last 7 days only",
     ]),
   ];
 
@@ -74,6 +80,8 @@ export function buildHealthSummaryExportCsv(
         row.notConnected7Days,
         row.neverConnected,
         formatPctHealthy(row.pctHealthy),
+        formatAvgTemp30d(row.avgCoolerTemp30d),
+        formatAvgTemp30d(row.avgFreezerTemp30d),
       ]),
     );
   }

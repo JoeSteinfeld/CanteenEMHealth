@@ -1045,6 +1045,25 @@ table.grid td.temp-avg-out-of-range {
   font-weight: 500;
 }
 
+table.health-summary-grid thead tr.th-group-row th.th-group-avg-temp30d {
+  background: #f0fdf4;
+  color: #166534;
+  border-left: 1px solid #bbf7d0;
+  border-right: 1px solid #bbf7d0;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  white-space: normal;
+  line-height: 1.25;
+  height: auto;
+  min-height: var(--col-group-row-height);
+  padding: 0.25rem 0.4rem;
+}
+
+.th-group-avg-temp30d-label {
+  display: block;
+}
+
 .health-summary-ok {
   color: #15803d;
 }
@@ -1095,9 +1114,38 @@ table.grid td.temp-avg-out-of-range {
 
 .fleet-summary-metrics {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.35rem 0.5rem;
+  flex-wrap: nowrap;
+  align-items: stretch;
+  justify-content: space-between;
+  gap: 0.75rem 1rem;
+  width: 100%;
+  overflow-x: auto;
+}
+
+.fleet-summary-metric {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.2rem;
+  min-width: 0;
+  flex: 1 1 0;
+}
+
+.fleet-summary-metric-label {
+  font-size: 0.92rem;
+  font-weight: 600;
+  line-height: 1.25;
+  color: #0f172a;
+  white-space: normal;
+}
+
+.fleet-summary-metric-value {
+  margin-top: auto;
+  font-size: 0.92rem;
+  font-weight: 600;
+  color: #0f172a;
+  line-height: 1.2;
+  white-space: nowrap;
 }
 
 .fleet-summary-line strong {
@@ -1936,7 +1984,7 @@ button.temp-history-daily-clear {
 
 .trends-org-delta-stats {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 0.75rem;
   margin-bottom: 0.75rem;
 }
@@ -1966,7 +2014,7 @@ button.temp-history-daily-clear {
 
 .trends-org-counts-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 0.75rem;
   border-top: 1px solid #e2e8f0;
   margin-top: 0.85rem;

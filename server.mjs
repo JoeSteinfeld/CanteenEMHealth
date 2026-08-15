@@ -18,8 +18,11 @@ import { openHealthSummaryDb } from "./health-summary-db.mjs";
 import { buildHealthSummaryTrends } from "./health-summary-trends.mjs";
 import {
   getHealthSummaryScheduleInfo,
+  getZonedYmd,
   startDailyHealthSummaryScheduler,
+  utcMsAtZoneMidnight,
 } from "./health-summary-scheduler.mjs";
+import { openSensorDailyTempDb } from "./sensor-daily-temp-db.mjs";
 import {
   EM_WIDGET_READING_IDS,
   hasEmWidgetReadings,
@@ -55,11 +58,13 @@ const STALE_MS = 7 * 24 * 60 * 60 * 1000;
 /** Guard very deep pagination for one-sensor history (30 days). */
 const READINGS_HISTORY_MAX_PAGES = 500;
 
-/** Parallel sensors when computing 30-day temp max/min/avg (history is per-sensor). */
-const TEMP_STATS_CONCURRENCY = Math.max(
-  1,
-  Number(process.env.SAMSARA_TEMP_STATS_CONCURRENCY ?? 4) || 4,
-);
+/** Daily resolution for Temperature (30d) via POST /v1/sensors/history (stored locally). */
+const TEMP_STATS_STEP_MS = 24 * 60 * 60 * 1000;
+const TEMP_STATS_WINDOW_DAYS = 30;
+/** Keep extra days beyond the rolling window for late updates / re-runs. */
+const TEMP_STATS_RETENTION_DAYS = 60;
+/** Legacy Get sensor history accepts at most 40 series per request. */
+const SENSOR_HISTORY_BATCH = 40;
 
 const NOTES_DB_PATH = resolveSqliteDbPath(
   process.env.NOTES_DB_PATH,
@@ -76,9 +81,15 @@ const HEALTH_SUMMARY_DB_PATH = resolveSqliteDbPath(
   "health-summary.sqlite",
   join(process.cwd(), "data", "health-summary.sqlite"),
 );
+const SENSOR_DAILY_TEMP_DB_PATH = resolveSqliteDbPath(
+  process.env.SENSOR_DAILY_TEMP_DB_PATH,
+  "sensor-daily-temps.sqlite",
+  join(process.cwd(), "data", "sensor-daily-temps.sqlite"),
+);
 const notesStore = openSensorNotesDb(NOTES_DB_PATH);
 const auditLog = openAuditDb(AUDIT_DB_PATH);
 const healthSummaryStore = openHealthSummaryDb(HEALTH_SUMMARY_DB_PATH);
+const dailyTempStore = openSensorDailyTempDb(SENSOR_DAILY_TEMP_DB_PATH);
 
 function auditFromRequest(req, event, username = null) {
   auditLog.record({
@@ -415,49 +426,119 @@ function uniqueSensorIdsFromTagRows(tagRows) {
   return [...ids];
 }
 
-function buildTagHealthSummaryFromTagRows(tagRows, readingsByEntity, retrievedAt, lastConnectedById) {
+/** Match Detailed Sensor Health: Freezer before Cooler, by sensor name (case-insensitive). */
+function emTempKindFromSensorName(sensorName) {
+  const n = String(sensorName ?? "")
+    .trim()
+    .toLowerCase();
+  if (n.includes("freezer")) return "freezer";
+  if (n.includes("cooler")) return "cooler";
+  return null;
+}
+
+/** Mean of finite numbers, or null if none. */
+function meanOfNumbers(values) {
+  let sum = 0;
+  let n = 0;
+  for (const v of values) {
+    if (typeof v !== "number" || !Number.isFinite(v)) continue;
+    sum += v;
+    n += 1;
+  }
+  return n > 0 ? sum / n : null;
+}
+
+/**
+ * Build one tag summary row, or null if the tag has no EM sensors.
+ * @param {Map<string, { avgF: number } | null> | null | undefined} tempAvgBySensorId
+ */
+function buildOneTagHealthSummaryRow(tag, readingsByEntity, retrievedAt, lastConnectedById, tempAvgBySensorId) {
+  if (!tag || tag.id == null) return null;
+  const tagName = tag.name != null ? String(tag.name) : "—";
+  const sensors = Array.isArray(tag.sensors) ? tag.sensors : [];
+  let totalSensors = 0;
+  let connectedLast7Days = 0;
+  let notConnected7Days = 0;
+  let neverConnected = 0;
+  /** @type {number[]} */
+  const coolerAvgs = [];
+  /** @type {number[]} */
+  const freezerAvgs = [];
+  for (const s of sensors) {
+    if (!s || s.id == null || !isEmHealthTagSensor(s, readingsByEntity)) continue;
+    totalSensors += 1;
+    const sid = String(s.id);
+    // GetTemperature ambientTemperatureTime (same as Detailed Sensor Health).
+    const lastConnected = lastConnectedById?.get(sid) ?? null;
+    const cat = connectivityCategory(lastConnected, retrievedAt);
+    if (cat === "never") neverConnected += 1;
+    else if (cat === "stale") notConnected7Days += 1;
+    else connectedLast7Days += 1;
+
+    const stats = tempAvgBySensorId?.get(sid) ?? null;
+    const avgF = stats && typeof stats.avgF === "number" && Number.isFinite(stats.avgF) ? stats.avgF : null;
+    // 30d cooler/freezer avgs only include sensors connected in the last 7 days.
+    if (avgF != null && cat === "connected") {
+      const kind = emTempKindFromSensorName(s.name);
+      if (kind === "cooler") coolerAvgs.push(avgF);
+      else if (kind === "freezer") freezerAvgs.push(avgF);
+    }
+  }
+  if (totalSensors === 0) return null;
+  const pctHealthy = (connectedLast7Days / totalSensors) * 100;
+  return {
+    tagId: String(tag.id),
+    tagName,
+    totalSensors,
+    connectedLast7Days,
+    notConnected7Days,
+    neverConnected,
+    pctHealthy,
+    avgCoolerTemp30d: meanOfNumbers(coolerAvgs),
+    avgFreezerTemp30d: meanOfNumbers(freezerAvgs),
+  };
+}
+
+/**
+ * @param {Map<string, { avgF: number } | null> | null | undefined} tempAvgBySensorId
+ *        Per-sensor 30d avg °F from daily /v1/sensors/history points.
+ */
+function buildTagHealthSummaryFromTagRows(
+  tagRows,
+  readingsByEntity,
+  retrievedAt,
+  lastConnectedById,
+  tempAvgBySensorId,
+) {
   const rows = [];
   for (const tag of tagRows) {
-    if (!tag || tag.id == null) continue;
-    const tagName = tag.name != null ? String(tag.name) : "—";
-    const sensors = Array.isArray(tag.sensors) ? tag.sensors : [];
-    let totalSensors = 0;
-    let connectedLast7Days = 0;
-    let notConnected7Days = 0;
-    let neverConnected = 0;
-    for (const s of sensors) {
-      if (!s || s.id == null || !isEmHealthTagSensor(s, readingsByEntity)) continue;
-      totalSensors += 1;
-      const sid = String(s.id);
-      // GetTemperature ambientTemperatureTime (same as Detailed Sensor Health).
-      const lastConnected = lastConnectedById?.get(sid) ?? null;
-      const cat = connectivityCategory(lastConnected, retrievedAt);
-      if (cat === "never") neverConnected += 1;
-      else if (cat === "stale") notConnected7Days += 1;
-      else connectedLast7Days += 1;
-    }
-    if (totalSensors === 0) continue;
-    const pctHealthy = (connectedLast7Days / totalSensors) * 100;
-    rows.push({
-      tagId: String(tag.id),
-      tagName,
-      totalSensors,
-      connectedLast7Days,
-      notConnected7Days,
-      neverConnected,
-      pctHealthy,
-    });
+    const row = buildOneTagHealthSummaryRow(
+      tag,
+      readingsByEntity,
+      retrievedAt,
+      lastConnectedById,
+      tempAvgBySensorId,
+    );
+    if (row) rows.push(row);
   }
   rows.sort((a, b) => a.tagName.localeCompare(b.tagName, undefined, { sensitivity: "base" }));
   return rows;
 }
 
-function buildFleetHealthTotals(tagRows, readingsByEntity, retrievedAt, lastConnectedById) {
+function yieldEventLoop() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+function buildFleetHealthTotals(tagRows, readingsByEntity, retrievedAt, lastConnectedById, tempAvgBySensorId) {
   const seen = new Set();
   let totalSensors = 0;
   let connectedLast7Days = 0;
   let neverConnected = 0;
   let notConnected7Days = 0;
+  /** @type {number[]} */
+  const coolerAvgs = [];
+  /** @type {number[]} */
+  const freezerAvgs = [];
 
   for (const tag of tagRows) {
     if (!Array.isArray(tag?.sensors)) continue;
@@ -471,12 +552,29 @@ function buildFleetHealthTotals(tagRows, readingsByEntity, retrievedAt, lastConn
       const cat = connectivityCategory(lastConnected, retrievedAt);
       if (cat === "never") neverConnected += 1;
       else if (cat === "stale") notConnected7Days += 1;
-      else if (cat === "connected") connectedLast7Days += 1;
+      else if (cat === "connected") {
+        connectedLast7Days += 1;
+        const stats = tempAvgBySensorId?.get(sid) ?? null;
+        const avgF = stats && typeof stats.avgF === "number" && Number.isFinite(stats.avgF) ? stats.avgF : null;
+        if (avgF != null) {
+          const kind = emTempKindFromSensorName(s.name);
+          if (kind === "cooler") coolerAvgs.push(avgF);
+          else if (kind === "freezer") freezerAvgs.push(avgF);
+        }
+      }
     }
   }
 
   const pctHealthy = totalSensors > 0 ? (connectedLast7Days / totalSensors) * 100 : 0;
-  return { totalSensors, connectedLast7Days, neverConnected, notConnected7Days, pctHealthy };
+  return {
+    totalSensors,
+    connectedLast7Days,
+    neverConnected,
+    notConnected7Days,
+    pctHealthy,
+    avgCoolerTemp30d: meanOfNumbers(coolerAvgs),
+    avgFreezerTemp30d: meanOfNumbers(freezerAvgs),
+  };
 }
 
 function sortTagMap(tagMap) {
@@ -713,8 +811,15 @@ app.get("/api/health-summary/trends", (req, res) => {
 });
 
 /** Per-tag connectivity summary; aggregates on the server (one tags fetch + parallel readings). */
-async function fetchAndSaveHealthSummary() {
+async function fetchAndSaveHealthSummary(options = {}) {
+  const onEvent = typeof options.onEvent === "function" ? options.onEvent : null;
+  const emit = async (event) => {
+    if (!onEvent) return;
+    await onEvent(event);
+  };
+
   const retrievedAt = Date.now();
+  await emit({ type: "phase", message: "Loading tags…" });
   const tagRows = await paginateList("/tags", new URLSearchParams({ limit: "512" }));
   const sensorIds = uniqueSensorIdsFromTagRows(tagRows);
   if (sensorIds.length === 0) {
@@ -727,6 +832,8 @@ async function fetchAndSaveHealthSummary() {
         neverConnected: 0,
         notConnected7Days: 0,
         pctHealthy: 0,
+        avgCoolerTemp30d: null,
+        avgFreezerTemp30d: null,
       },
     };
     healthSummaryStore.saveSnapshot({
@@ -735,9 +842,16 @@ async function fetchAndSaveHealthSummary() {
       summaryRows: payload.data,
     });
     healthSummaryStore.checkpoint();
+    await emit({
+      type: "done",
+      dataRetrievedAt: retrievedAt,
+      fleetTotals: payload.fleetTotals,
+      data: payload.data,
+    });
     return payload;
   }
 
+  await emit({ type: "phase", message: "Loading sensor readings…" });
   const readingRows = await fetchReadingsSnapshotBatched(sensorIds);
   const readingsByEntity = indexReadingsByEntity(readingRows);
 
@@ -746,10 +860,69 @@ async function fetchAndSaveHealthSummary() {
     const rmap = readingsByEntity.get(String(id)) || new Map();
     if (hasEmWidgetReadings(rmap)) emSensorIds.push(String(id));
   }
+
+  await emit({ type: "phase", message: "Loading last-connected times…" });
   const { lastConnectedById } = await fetchGetTemperatureMetaBySensorId(emSensorIds);
 
-  const data = buildTagHealthSummaryFromTagRows(tagRows, readingsByEntity, retrievedAt, lastConnectedById);
-  const fleetTotals = buildFleetHealthTotals(tagRows, readingsByEntity, retrievedAt, lastConnectedById);
+  // Sync daily ambient temps into SQLite (full 30d backfill once, then incremental).
+  await emit({
+    type: "phase",
+    message: "Syncing daily temperatures…",
+    detail: emSensorIds.length ? `0 of ${emSensorIds.length} sensors` : undefined,
+  });
+  const tempAvgBySensorId = await syncAndGetTempStatsBySensorId(emSensorIds, async ({ done, total, mode }) => {
+    await emit({
+      type: "phase",
+      message: mode === "backfill" ? "Backfilling daily temperatures…" : "Syncing daily temperatures…",
+      detail: `${done} of ${total} sensors`,
+    });
+  });
+
+  /** @type {object[]} */
+  const tagsWithRows = [];
+  for (const tag of tagRows) {
+    const sensors = Array.isArray(tag?.sensors) ? tag.sensors : [];
+    const hasEm = sensors.some((s) => s && s.id != null && isEmHealthTagSensor(s, readingsByEntity));
+    if (hasEm) tagsWithRows.push(tag);
+  }
+  // Stable order matching final sort (by name) so "N of total" feels natural in the table.
+  tagsWithRows.sort((a, b) => {
+    const an = a.name != null ? String(a.name) : "—";
+    const bn = b.name != null ? String(b.name) : "—";
+    return an.localeCompare(bn, undefined, { sensitivity: "base" });
+  });
+
+  const total = tagsWithRows.length;
+  await emit({ type: "start", total, dataRetrievedAt: retrievedAt });
+
+  /** @type {object[]} */
+  const data = [];
+  for (let i = 0; i < tagsWithRows.length; i++) {
+    const row = buildOneTagHealthSummaryRow(
+      tagsWithRows[i],
+      readingsByEntity,
+      retrievedAt,
+      lastConnectedById,
+      tempAvgBySensorId,
+    );
+    if (!row) continue;
+    data.push(row);
+    await emit({
+      type: "tag",
+      index: data.length,
+      total,
+      row,
+    });
+    await yieldEventLoop();
+  }
+
+  const fleetTotals = buildFleetHealthTotals(
+    tagRows,
+    readingsByEntity,
+    retrievedAt,
+    lastConnectedById,
+    tempAvgBySensorId,
+  );
 
   healthSummaryStore.saveSnapshot({
     dataRetrievedAt: retrievedAt,
@@ -757,6 +930,13 @@ async function fetchAndSaveHealthSummary() {
     summaryRows: data,
   });
   healthSummaryStore.checkpoint();
+
+  await emit({
+    type: "done",
+    dataRetrievedAt: retrievedAt,
+    fleetTotals,
+    data,
+  });
 
   return { dataRetrievedAt: retrievedAt, data, fleetTotals };
 }
@@ -788,6 +968,43 @@ app.get("/api/health-summary", async (_req, res) => {
         ? "SQLite could not write the health-summary database (common when the project folder is on Google Drive). Restart the server so DBs move to ~/Library/Application Support/CanteenEMHealth/, or set HEALTH_SUMMARY_DB_PATH to a local path."
         : "Confirm Read Tags, Read Readings, and Write Sensors (GetTemperature) on the API token. Tags must return a sensors list.",
     });
+  }
+});
+
+/**
+ * Same as /api/health-summary, but streams NDJSON progress events:
+ * phase → start → tag (per tag) → done.
+ */
+app.get("/api/health-summary/stream", async (req, res) => {
+  if (!requireToken(res)) return;
+  res.status(200);
+  res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("X-Accel-Buffering", "no");
+  if (typeof res.flushHeaders === "function") res.flushHeaders();
+
+  const writeEvent = async (event) => {
+    if (res.writableEnded) return;
+    res.write(`${JSON.stringify(event)}\n`);
+    // Give the proxy/client a chance to flush between tags.
+    await yieldEventLoop();
+  };
+
+  try {
+    await fetchAndSaveHealthSummary({ onEvent: writeEvent });
+    if (!res.writableEnded) res.end();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    const io = isSqliteIoError(e) || /disk I\/O error/i.test(msg);
+    const hint = io
+      ? "SQLite could not write the health-summary database (common when the project folder is on Google Drive). Restart the server so DBs move to ~/Library/Application Support/CanteenEMHealth/, or set HEALTH_SUMMARY_DB_PATH to a local path."
+      : "Confirm Read Tags, Read Readings, and Write Sensors (GetTemperature) on the API token. Tags must return a sensors list.";
+    try {
+      await writeEvent({ type: "error", error: msg, hint });
+    } catch {
+      /* ignore */
+    }
+    if (!res.writableEnded) res.end();
   }
 });
 
@@ -936,7 +1153,8 @@ app.get("/api/sensor-temperature-history", async (req, res) => {
 
 /**
  * Batch 30-day max/min/avg ambient temperature (°F) for many sensors.
- * Body: { sensorIds: string[] }. Runs with limited concurrency; soft-fails per sensor.
+ * Syncs daily points into SQLite (backfill once, then incremental), then averages locally.
+ * Body: { sensorIds: string[] }. Soft-fails per batch of up to 40 sensors.
  */
 app.post("/api/sensor-temperature-stats", async (req, res) => {
   if (!requireToken(res)) return;
@@ -958,7 +1176,7 @@ app.post("/api/sensor-temperature-stats", async (req, res) => {
   const capped = sensorIds.slice(0, 500);
 
   try {
-    const byId = await fetchTempStatsBySensorId(capped);
+    const byId = await syncAndGetTempStatsBySensorId(capped);
     const data = {};
     for (const id of capped) {
       const stats = byId.get(id) ?? null;
@@ -974,12 +1192,18 @@ app.post("/api/sensor-temperature-stats", async (req, res) => {
           }
         : null;
     }
-    res.json({ data, readingId: TEMP_BLE_READING_ID, windowDays: 30 });
+    res.json({
+      data,
+      field: "ambientTemperature",
+      source: "local sensor-daily-temps + POST /v1/sensors/history",
+      stepMs: TEMP_STATS_STEP_MS,
+      windowDays: TEMP_STATS_WINDOW_DAYS,
+    });
   } catch (e) {
     res.status(e.status || 500).json({
       error: e.message,
       details: e.body,
-      hint: "Requires Read Readings scope and GET /readings/history access.",
+      hint: "Requires Write Sensors scope and POST /v1/sensors/history access.",
     });
   }
 });
@@ -1040,58 +1264,140 @@ function formatTempFDisplay(f) {
 }
 
 /**
- * 30-day ambient BLE temperature max/min/avg for one sensor (no point payload).
- * @returns {Promise<{ maxF: number, minF: number, avgF: number, count: number } | null>}
+ * Legacy sensor history temperatures are millidegrees Celsius (same as GetTemperature).
+ * @param {unknown} milli
+ * @returns {number | null}
  */
-async function computeTempStatsForSensor(sensorId) {
-  const endMs = Date.now();
-  const startMs = endMs - 30 * 24 * 60 * 60 * 1000;
-  const params = new URLSearchParams();
-  params.set("entityType", READINGS_ENTITY_TYPE);
-  params.set("entityIds", sensorId);
-  params.set("readingId", TEMP_BLE_READING_ID);
-  params.set("startTime", new Date(startMs).toISOString());
-  params.set("endTime", new Date(endMs).toISOString());
+function millidegreesCelsiusToFahrenheit(milli) {
+  if (typeof milli !== "number" || !Number.isFinite(milli)) return null;
+  const c = milli / 1000;
+  return (c * 9) / 5 + 32;
+}
 
-  const rows = await paginateReadingsHistory(params);
-  let maxF = -Infinity;
-  let minF = Infinity;
-  let sum = 0;
-  let n = 0;
-  for (const row of rows) {
-    if (!row || row.entityId == null) continue;
-    if (String(row.entityId) !== sensorId) continue;
-    const f = readingCelsiusToFahrenheit(row.value);
-    if (f == null) continue;
-    maxF = Math.max(maxF, f);
-    minF = Math.min(minF, f);
-    sum += f;
-    n += 1;
-  }
-  if (n === 0) return null;
-  return { maxF, minF, avgF: sum / n, count: n };
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+/** Add calendar days to a YYYY-MM-DD (UTC date arithmetic; matches Eastern YMD strings). */
+function addDaysYmd(ymd, deltaDays) {
+  const [y, m, d] = String(ymd).split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d + deltaDays));
+  return `${dt.getUTCFullYear()}-${pad2(dt.getUTCMonth() + 1)}-${pad2(dt.getUTCDate())}`;
 }
 
 /**
+ * Sync daily ambient temps into SQLite, then return rolling-window max/min/avg from local rows.
+ * - Baseline per sensor = earliest day already stored for that sensor
+ * - No rows yet: backfill from rolling window start (~30 days) → today (establishes baseline)
+ * - Has rows: only fetch from last_synced_day (or baseline if meta missing) → today
+ *
  * @param {string[]} sensorIds
+ * @param {(p: { done: number, total: number, mode: "backfill" | "incremental" }) => void | Promise<void>} [onProgress]
  * @returns {Promise<Map<string, { maxF: number, minF: number, avgF: number, count: number } | null>>}
  */
-async function fetchTempStatsBySensorId(sensorIds) {
-  const ids = [...new Set(sensorIds.map(String))];
+async function syncAndGetTempStatsBySensorId(sensorIds, onProgress) {
   const out = new Map();
-  for (let i = 0; i < ids.length; i += TEMP_STATS_CONCURRENCY) {
-    const wave = ids.slice(i, i + TEMP_STATS_CONCURRENCY);
-    await Promise.all(
-      wave.map(async (id) => {
-        try {
-          out.set(id, await computeTempStatsForSensor(id));
-        } catch (e) {
-          console.warn("Temp stats (30d) unavailable for sensor", id, e instanceof Error ? e.message : e);
-          out.set(id, null);
-        }
-      }),
-    );
+  /** @type {string[]} */
+  const numericIds = [];
+  for (const id of sensorIds) {
+    const sid = String(id);
+    const n = Number(sid);
+    if (Number.isFinite(n) && Number.isSafeInteger(n)) numericIds.push(sid);
+    else out.set(sid, null);
   }
+  const unique = [...new Set(numericIds)];
+  if (unique.length === 0) return out;
+
+  const today = getZonedYmd(Date.now());
+  const windowStart = addDaysYmd(today, -(TEMP_STATS_WINDOW_DAYS - 1));
+  const lastSyncedById = dailyTempStore.getLastSyncedDays(unique);
+  const baselineById = dailyTempStore.getBaselineDays(unique);
+  const endMs = Date.now();
+
+  for (let i = 0; i < unique.length; i += SENSOR_HISTORY_BATCH) {
+    const chunk = unique.slice(i, i + SENSOR_HISTORY_BATCH);
+    let startDay = today;
+    let anyBackfill = false;
+    for (const sid of chunk) {
+      const baseline = baselineById.get(sid);
+      const last = lastSyncedById.get(sid);
+      let needStart;
+      if (!baseline) {
+        // No local history yet — backfill the rolling window (first day stored becomes baseline).
+        anyBackfill = true;
+        needStart = windowStart;
+      } else if (last && last >= baseline) {
+        // Incremental from last successful sync (refresh that day for late data).
+        needStart = last;
+      } else {
+        // Rows exist but meta missing/stale relative to baseline — resume from baseline.
+        needStart = baseline;
+      }
+      if (needStart < startDay) startDay = needStart;
+    }
+
+    try {
+      const startMs = utcMsAtZoneMidnight(startDay);
+      const body = await samsaraPost("/v1/sensors/history", {
+        startMs,
+        endMs,
+        stepMs: TEMP_STATS_STEP_MS,
+        fillMissing: "withNull",
+        series: chunk.map((widgetId) => ({
+          widgetId: Number(widgetId),
+          field: "ambientTemperature",
+        })),
+      });
+      /** @type {{ sensorId: string, day: string, tempF: number }[]} */
+      const points = [];
+      const results = Array.isArray(body?.results) ? body.results : [];
+      for (const row of results) {
+        const timeMs = typeof row?.timeMs === "number" ? row.timeMs : Number(row?.timeMs);
+        if (!Number.isFinite(timeMs)) continue;
+        const day = getZonedYmd(timeMs);
+        const vals = Array.isArray(row?.series) ? row.series : [];
+        for (let j = 0; j < chunk.length; j++) {
+          const f = millidegreesCelsiusToFahrenheit(vals[j]);
+          if (f == null) continue;
+          points.push({ sensorId: chunk[j], day, tempF: f });
+        }
+      }
+      dailyTempStore.upsertDailyTemps(points);
+      dailyTempStore.markSyncedThrough(chunk, today);
+      for (const sid of chunk) {
+        lastSyncedById.set(sid, today);
+        if (!baselineById.get(sid)) {
+          // After first backfill, baseline becomes the earliest stored day for this sensor.
+          const refreshed = dailyTempStore.getBaselineDays([sid]).get(sid) ?? null;
+          baselineById.set(sid, refreshed);
+        }
+      }
+    } catch (e) {
+      console.warn(
+        "Daily temp sync unavailable for sensors/history batch:",
+        e instanceof Error ? e.message : e,
+      );
+    }
+
+    const done = Math.min(i + chunk.length, unique.length);
+    if (typeof onProgress === "function") {
+      await onProgress({
+        done,
+        total: unique.length,
+        mode: anyBackfill ? "backfill" : "incremental",
+      });
+    }
+  }
+
+  try {
+    dailyTempStore.pruneBeforeDay(addDaysYmd(today, -TEMP_STATS_RETENTION_DAYS));
+    dailyTempStore.checkpoint();
+  } catch (e) {
+    console.warn("Daily temp prune/checkpoint failed:", e instanceof Error ? e.message : e);
+  }
+
+  const fromDb = dailyTempStore.getStatsForWindowMany(unique, windowStart, today);
+  for (const id of unique) out.set(id, fromDb.get(id) ?? null);
   return out;
 }
 
@@ -1109,6 +1415,7 @@ const server = app.listen(PORT, () => {
   console.log(`Sensor notes DB: ${NOTES_DB_PATH}`);
   console.log(`Access audit DB: ${AUDIT_DB_PATH}`);
   console.log(`Health summary DB: ${HEALTH_SUMMARY_DB_PATH}`);
+  console.log(`Sensor daily temps DB: ${SENSOR_DAILY_TEMP_DB_PATH}`);
   const snapshotCount = healthSummaryStore.getSnapshotCount();
   const latest = healthSummaryStore.getLatestSnapshot();
   if (latest) {
@@ -1140,6 +1447,11 @@ function shutdownDatabases() {
   }
   try {
     healthSummaryStore.close();
+  } catch {
+    /* ignore */
+  }
+  try {
+    dailyTempStore.close();
   } catch {
     /* ignore */
   }

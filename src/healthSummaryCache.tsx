@@ -44,13 +44,35 @@ const HealthSummaryCacheContext = createContext<HealthSummaryCacheValue | null>(
 function isFleetHealthTotals(value: unknown): value is FleetHealthTotals {
   if (!value || typeof value !== "object") return false;
   const o = value as Record<string, unknown>;
+  const optionalNum = (v: unknown) => v == null || (typeof v === "number" && Number.isFinite(v));
   return (
     typeof o.totalSensors === "number" &&
     typeof o.connectedLast7Days === "number" &&
     typeof o.neverConnected === "number" &&
     typeof o.notConnected7Days === "number" &&
-    typeof o.pctHealthy === "number"
+    typeof o.pctHealthy === "number" &&
+    optionalNum(o.avgCoolerTemp30d) &&
+    optionalNum(o.avgFreezerTemp30d)
   );
+}
+
+function normalizeFleetHealthTotals(totals: FleetHealthTotals): FleetHealthTotals {
+  return {
+    ...totals,
+    avgCoolerTemp30d:
+      typeof totals.avgCoolerTemp30d === "number" && Number.isFinite(totals.avgCoolerTemp30d)
+        ? totals.avgCoolerTemp30d
+        : null,
+    avgFreezerTemp30d:
+      typeof totals.avgFreezerTemp30d === "number" && Number.isFinite(totals.avgFreezerTemp30d)
+        ? totals.avgFreezerTemp30d
+        : null,
+  };
+}
+
+function optionalFiniteNumberOrNull(value: unknown): boolean {
+  if (value == null) return true;
+  return typeof value === "number" && Number.isFinite(value);
 }
 
 function isTagHealthSummaryRow(value: unknown): value is TagHealthSummaryRow {
@@ -63,12 +85,28 @@ function isTagHealthSummaryRow(value: unknown): value is TagHealthSummaryRow {
     typeof r.connectedLast7Days === "number" &&
     typeof r.notConnected7Days === "number" &&
     typeof r.neverConnected === "number" &&
-    typeof r.pctHealthy === "number"
+    typeof r.pctHealthy === "number" &&
+    optionalFiniteNumberOrNull(r.avgCoolerTemp30d) &&
+    optionalFiniteNumberOrNull(r.avgFreezerTemp30d)
   );
 }
 
+function normalizeTagHealthSummaryRow(row: TagHealthSummaryRow): TagHealthSummaryRow {
+  return {
+    ...row,
+    avgCoolerTemp30d:
+      typeof row.avgCoolerTemp30d === "number" && Number.isFinite(row.avgCoolerTemp30d)
+        ? row.avgCoolerTemp30d
+        : null,
+    avgFreezerTemp30d:
+      typeof row.avgFreezerTemp30d === "number" && Number.isFinite(row.avgFreezerTemp30d)
+        ? row.avgFreezerTemp30d
+        : null,
+  };
+}
+
 function normalizeSummaryRows(rows: TagHealthSummaryRow[]): TagHealthSummaryRow[] {
-  return rows.filter((row) => row.totalSensors > 0);
+  return rows.filter((row) => row.totalSensors > 0).map(normalizeTagHealthSummaryRow);
 }
 
 type SnapshotPayload = {
@@ -85,7 +123,7 @@ function parseSnapshotResponse(j: {
   const retrievedAt =
     typeof j.dataRetrievedAt === "number" && Number.isFinite(j.dataRetrievedAt) ? j.dataRetrievedAt : null;
   const list = Array.isArray(j.data) ? j.data.filter(isTagHealthSummaryRow) : null;
-  const totals = isFleetHealthTotals(j.fleetTotals) ? j.fleetTotals : null;
+  const totals = isFleetHealthTotals(j.fleetTotals) ? normalizeFleetHealthTotals(j.fleetTotals) : null;
   if (retrievedAt == null || list == null || totals == null) return null;
   return {
     summaryRows: normalizeSummaryRows(list),

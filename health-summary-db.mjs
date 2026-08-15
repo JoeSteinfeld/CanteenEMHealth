@@ -2,6 +2,11 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { openSqliteDb, checkpointSqliteDb, isSqliteIoError, recoverStaleWalSidecars } from "./sqlite-open.mjs";
 
+function optionalFiniteNumberOrNull(value) {
+  if (value == null) return true;
+  return typeof value === "number" && Number.isFinite(value);
+}
+
 function isTagHealthSummaryRow(value) {
   if (!value || typeof value !== "object") return false;
   const r = value;
@@ -12,8 +17,25 @@ function isTagHealthSummaryRow(value) {
     typeof r.connectedLast7Days === "number" &&
     typeof r.notConnected7Days === "number" &&
     typeof r.neverConnected === "number" &&
-    typeof r.pctHealthy === "number"
+    typeof r.pctHealthy === "number" &&
+    optionalFiniteNumberOrNull(r.avgCoolerTemp30d) &&
+    optionalFiniteNumberOrNull(r.avgFreezerTemp30d)
   );
+}
+
+/** Older snapshots omit the 30d avg columns — normalize to null. */
+function normalizeTagHealthSummaryRow(row) {
+  return {
+    ...row,
+    avgCoolerTemp30d:
+      typeof row.avgCoolerTemp30d === "number" && Number.isFinite(row.avgCoolerTemp30d)
+        ? row.avgCoolerTemp30d
+        : null,
+    avgFreezerTemp30d:
+      typeof row.avgFreezerTemp30d === "number" && Number.isFinite(row.avgFreezerTemp30d)
+        ? row.avgFreezerTemp30d
+        : null,
+  };
 }
 
 function isFleetHealthTotals(value) {
@@ -24,8 +46,24 @@ function isFleetHealthTotals(value) {
     typeof o.connectedLast7Days === "number" &&
     typeof o.neverConnected === "number" &&
     typeof o.notConnected7Days === "number" &&
-    typeof o.pctHealthy === "number"
+    typeof o.pctHealthy === "number" &&
+    optionalFiniteNumberOrNull(o.avgCoolerTemp30d) &&
+    optionalFiniteNumberOrNull(o.avgFreezerTemp30d)
   );
+}
+
+function normalizeFleetHealthTotals(totals) {
+  return {
+    ...totals,
+    avgCoolerTemp30d:
+      typeof totals.avgCoolerTemp30d === "number" && Number.isFinite(totals.avgCoolerTemp30d)
+        ? totals.avgCoolerTemp30d
+        : null,
+    avgFreezerTemp30d:
+      typeof totals.avgFreezerTemp30d === "number" && Number.isFinite(totals.avgFreezerTemp30d)
+        ? totals.avgFreezerTemp30d
+        : null,
+  };
 }
 
 function parseJsonArray(text) {
@@ -97,8 +135,8 @@ export function openHealthSummaryDb(dbPath) {
     return {
       id: Number(row.id),
       dataRetrievedAt,
-      fleetTotals,
-      summaryRows,
+      fleetTotals: normalizeFleetHealthTotals(fleetTotals),
+      summaryRows: summaryRows.map(normalizeTagHealthSummaryRow),
       storedAt: Number(row.created_at),
     };
   }

@@ -112,6 +112,12 @@ function tagMapFromRows(rows) {
   return m;
 }
 
+function optionalNumDelta(current, baseline) {
+  if (typeof current !== "number" || !Number.isFinite(current)) return null;
+  if (typeof baseline !== "number" || !Number.isFinite(baseline)) return null;
+  return current - baseline;
+}
+
 function fleetDelta(current, baseline) {
   const c = current.fleetTotals;
   const b = baseline.fleetTotals;
@@ -121,6 +127,8 @@ function fleetDelta(current, baseline) {
     notConnected7Days: c.notConnected7Days - b.notConnected7Days,
     neverConnected: c.neverConnected - b.neverConnected,
     totalSensors: c.totalSensors - b.totalSensors,
+    avgCoolerTemp30d: optionalNumDelta(c.avgCoolerTemp30d, b.avgCoolerTemp30d),
+    avgFreezerTemp30d: optionalNumDelta(c.avgFreezerTemp30d, b.avgFreezerTemp30d),
   };
 }
 
@@ -345,6 +353,14 @@ function buildOrgHistory(snapshots, maxStacks, rangeStartAt = null, rangeEndAt =
     notConnected7Days: s.fleetTotals.notConnected7Days,
     neverConnected: s.fleetTotals.neverConnected,
     totalSensors: s.fleetTotals.totalSensors,
+    avgCoolerTemp30d:
+      typeof s.fleetTotals.avgCoolerTemp30d === "number" && Number.isFinite(s.fleetTotals.avgCoolerTemp30d)
+        ? s.fleetTotals.avgCoolerTemp30d
+        : null,
+    avgFreezerTemp30d:
+      typeof s.fleetTotals.avgFreezerTemp30d === "number" && Number.isFinite(s.fleetTotals.avgFreezerTemp30d)
+        ? s.fleetTotals.avgFreezerTemp30d
+        : null,
   }));
 
   return evenlySamplePoints(chronological, maxStacks);

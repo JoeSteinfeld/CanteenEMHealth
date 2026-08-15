@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { formatPctHealthy } from "./sensorHealth";
+import { formatAvgTemp30d, formatPctHealthy } from "./sensorHealth";
 import {
   deltaTone,
   emptyTagTrendColumnSearch,
@@ -364,6 +364,18 @@ export function Trends() {
                 </span>
                 <span className="trends-stat-label">Δ connected</span>
               </div>
+              <div className="trends-stat" title="Connected in last 7 days only">
+                <span className="trends-stat-value">
+                  <DeltaCell value={orgDelta.avgCoolerTemp30d} suffix="°F" variant="baseline" />
+                </span>
+                <span className="trends-stat-label">Δ Cooler Temp (30d)</span>
+              </div>
+              <div className="trends-stat" title="Connected in last 7 days only">
+                <span className="trends-stat-value">
+                  <DeltaCell value={orgDelta.avgFreezerTemp30d} suffix="°F" variant="baseline" />
+                </span>
+                <span className="trends-stat-label">Δ Freezer Temp (30d)</span>
+              </div>
             </div>
             <div className="trends-org-counts-grid">
               <div className="trends-count-stat">
@@ -389,6 +401,18 @@ export function Trends() {
                   {fleet.totalSensors.toLocaleString()}
                 </span>
                 <span className="trends-count-label">Total sensors</span>
+              </div>
+              <div className="trends-count-stat" title="Connected in last 7 days only">
+                <span className="trends-count-value trends-count-total mono">
+                  {formatAvgTemp30d(fleet.avgCoolerTemp30d)}
+                </span>
+                <span className="trends-count-label">Avg Cooler Temp (30d)</span>
+              </div>
+              <div className="trends-count-stat" title="Connected in last 7 days only">
+                <span className="trends-count-value trends-count-total mono">
+                  {formatAvgTemp30d(fleet.avgFreezerTemp30d)}
+                </span>
+                <span className="trends-count-label">Avg Freezer Temp (30d)</span>
               </div>
             </div>
           </section>

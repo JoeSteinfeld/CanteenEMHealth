@@ -24,6 +24,11 @@ export type PersistedHealthSummaryUi = {
   columnSearch: Record<TagHealthSummarySortKey, string>;
 };
 
+function optionalFiniteNumberOrNull(value: unknown): boolean {
+  if (value == null) return true;
+  return typeof value === "number" && Number.isFinite(value);
+}
+
 function isTagHealthSummaryRow(value: unknown): value is TagHealthSummaryRow {
   if (!value || typeof value !== "object") return false;
   const r = value as Record<string, unknown>;
@@ -34,8 +39,24 @@ function isTagHealthSummaryRow(value: unknown): value is TagHealthSummaryRow {
     typeof r.connectedLast7Days === "number" &&
     typeof r.notConnected7Days === "number" &&
     typeof r.neverConnected === "number" &&
-    typeof r.pctHealthy === "number"
+    typeof r.pctHealthy === "number" &&
+    optionalFiniteNumberOrNull(r.avgCoolerTemp30d) &&
+    optionalFiniteNumberOrNull(r.avgFreezerTemp30d)
   );
+}
+
+function normalizeTagHealthSummaryRow(row: TagHealthSummaryRow): TagHealthSummaryRow {
+  return {
+    ...row,
+    avgCoolerTemp30d:
+      typeof row.avgCoolerTemp30d === "number" && Number.isFinite(row.avgCoolerTemp30d)
+        ? row.avgCoolerTemp30d
+        : null,
+    avgFreezerTemp30d:
+      typeof row.avgFreezerTemp30d === "number" && Number.isFinite(row.avgFreezerTemp30d)
+        ? row.avgFreezerTemp30d
+        : null,
+  };
 }
 
 function isSortKey(value: unknown): value is TagHealthSummarySortKey {
@@ -46,7 +67,9 @@ function isSortKey(value: unknown): value is TagHealthSummarySortKey {
     value === "connectedLast7Days" ||
     value === "notConnected7Days" ||
     value === "neverConnected" ||
-    value === "pctHealthy"
+    value === "pctHealthy" ||
+    value === "avgCoolerTemp30d" ||
+    value === "avgFreezerTemp30d"
   );
 }
 
@@ -63,13 +86,30 @@ function parseColumnSearch(value: unknown): Record<TagHealthSummarySortKey, stri
 function isFleetHealthTotals(value: unknown): value is FleetHealthTotals {
   if (!value || typeof value !== "object") return false;
   const o = value as Record<string, unknown>;
+  const optionalNum = (v: unknown) => v == null || (typeof v === "number" && Number.isFinite(v));
   return (
     typeof o.totalSensors === "number" &&
     typeof o.connectedLast7Days === "number" &&
     typeof o.neverConnected === "number" &&
     typeof o.notConnected7Days === "number" &&
-    typeof o.pctHealthy === "number"
+    typeof o.pctHealthy === "number" &&
+    optionalNum(o.avgCoolerTemp30d) &&
+    optionalNum(o.avgFreezerTemp30d)
   );
+}
+
+function normalizeFleetHealthTotals(totals: FleetHealthTotals): FleetHealthTotals {
+  return {
+    ...totals,
+    avgCoolerTemp30d:
+      typeof totals.avgCoolerTemp30d === "number" && Number.isFinite(totals.avgCoolerTemp30d)
+        ? totals.avgCoolerTemp30d
+        : null,
+    avgFreezerTemp30d:
+      typeof totals.avgFreezerTemp30d === "number" && Number.isFinite(totals.avgFreezerTemp30d)
+        ? totals.avgFreezerTemp30d
+        : null,
+  };
 }
 
 export function loadPersistedHealthSummaryUi(): PersistedHealthSummaryUi {
@@ -106,8 +146,8 @@ export function loadPersistedHealthSummary(): PersistedHealthSummary | null {
     const sortKey = isSortKey(parsed.sortKey) ? parsed.sortKey : "tagName";
     const sortDir = parsed.sortDir === "desc" ? "desc" : "asc";
     return {
-      summaryRows: parsed.summaryRows,
-      fleetTotals: parsed.fleetTotals,
+      summaryRows: parsed.summaryRows.map(normalizeTagHealthSummaryRow),
+      fleetTotals: normalizeFleetHealthTotals(parsed.fleetTotals),
       dataRetrievedAt: parsed.dataRetrievedAt,
       sortKey,
       sortDir,

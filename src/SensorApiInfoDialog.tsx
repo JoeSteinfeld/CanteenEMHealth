@@ -81,12 +81,12 @@ const API_INFO_ROWS: ApiInfoRow[] = [
   },
   {
     metric: "Max / Min / Avg",
-    source: "Get Readings History",
+    source: "Local daily temps + Get Sensor History",
     apiLinks: [
-      { label: "GET /readings/history", href: "https://developers.samsara.com/reference/getreadingshistory" },
+      { label: "POST /v1/sensors/history", href: "https://developers.samsara.com/reference/v1getsensorshistory" },
     ],
     detail:
-      "Temperature (30d): same ambient BLE temperature readingId over the last 30 days; max, min, and average computed server-side after the table loads.",
+      "Temperature (30d): daily ambientTemperature points stored in SQLite (first run backfills ~30 days; later runs sync new days only). Max/min/avg computed from the local rolling window.",
   },
   {
     metric: "Action",

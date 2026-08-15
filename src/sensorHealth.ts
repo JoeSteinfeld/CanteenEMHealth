@@ -9,7 +9,7 @@ export type SensorRow = {
   batteryVoltage: string;
   batteryVoltageLow: string;
   temperature: string;
-  /** 30-day ambient BLE temp max/min/avg display (°F); "…" while loading, "—" if none */
+  /** 30-day ambient temp max/min/avg (°F) from local daily-temp SQLite (synced via /v1/sensors/history); "…" while loading, "—" if none */
   tempMax30d: string;
   tempMin30d: string;
   tempAvg30d: string;
@@ -26,6 +26,10 @@ export type TagHealthSummaryRow = {
   notConnected7Days: number;
   neverConnected: number;
   pctHealthy: number;
+  /** Mean of per-sensor 30d daily-history avgs (°F) for Cooler-named EMs connected in last 7 days; null if none */
+  avgCoolerTemp30d: number | null;
+  /** Mean of per-sensor 30d daily-history avgs (°F) for Freezer-named EMs connected in last 7 days; null if none */
+  avgFreezerTemp30d: number | null;
 };
 
 /** Unique sensors fleet-wide (each sensor counted once, even if on multiple tags). */
@@ -35,6 +39,10 @@ export type FleetHealthTotals = {
   neverConnected: number;
   notConnected7Days: number;
   pctHealthy: number;
+  /** Fleet mean of Cooler 30d avgs (connected in last 7 days only); null if none */
+  avgCoolerTemp30d: number | null;
+  /** Fleet mean of Freezer 30d avgs (connected in last 7 days only); null if none */
+  avgFreezerTemp30d: number | null;
 };
 
 export type TagHealthSummarySortKey = keyof TagHealthSummaryRow;
@@ -53,7 +61,7 @@ export function isMissingLastConnected(lastConnectedIso: string | null): boolean
 /** True if last connected is strictly more than 7 days before `retrievedAt`. */
 export function isLastConnectedStale(lastConnectedIso: string | null, retrievedAt: number | null): boolean {
   if (isMissingLastConnected(lastConnectedIso) || retrievedAt == null) return false;
-  const t = new Date(lastConnectedIso).getTime();
+  const t = new Date(lastConnectedIso as string).getTime();
   return retrievedAt - t > STALE_MS;
 }
 
@@ -125,6 +133,8 @@ export function buildTagHealthSummaryRows(
         notConnected7Days,
         neverConnected,
         pctHealthy,
+        avgCoolerTemp30d: null,
+        avgFreezerTemp30d: null,
       };
     })
     .filter((row) => row.totalSensors > 0);
@@ -135,8 +145,15 @@ export function formatPctHealthy(n: number): string {
   return `${n.toFixed(1)}%`;
 }
 
+export function formatAvgTemp30d(n: number | null | undefined): string {
+  if (n == null || !Number.isFinite(n)) return "—";
+  return `${n.toFixed(1)}°F`;
+}
+
 export function summaryCellText(row: TagHealthSummaryRow, key: TagHealthSummarySortKey): string {
   if (key === "pctHealthy") return formatPctHealthy(row.pctHealthy);
+  if (key === "avgCoolerTemp30d") return formatAvgTemp30d(row.avgCoolerTemp30d);
+  if (key === "avgFreezerTemp30d") return formatAvgTemp30d(row.avgFreezerTemp30d);
   if (key === "tagName") return row.tagName;
   if (key === "tagId") return row.tagId;
   return String(row[key]);
@@ -150,6 +167,17 @@ export function compareTagHealthSummaryRows(
 ): number {
   if (key === "tagName") {
     return mul * a.tagName.localeCompare(b.tagName, undefined, { sensitivity: "base" });
+  }
+  if (key === "tagId") {
+    return mul * a.tagId.localeCompare(b.tagId, undefined, { sensitivity: "base" });
+  }
+  if (key === "avgCoolerTemp30d" || key === "avgFreezerTemp30d") {
+    const av = a[key];
+    const bv = b[key];
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1;
+    if (bv == null) return -1;
+    return mul * (av - bv);
   }
   return mul * (a[key] - b[key]);
 }
@@ -218,6 +246,8 @@ export function rowMatchesSummarySearch(
     "notConnected7Days",
     "neverConnected",
     "pctHealthy",
+    "avgCoolerTemp30d",
+    "avgFreezerTemp30d",
   ];
   for (const key of keys) {
     const q = filters[key].trim();
@@ -240,6 +270,8 @@ export function emptySummaryColumnSearch(): Record<TagHealthSummarySortKey, stri
     notConnected7Days: "",
     neverConnected: "",
     pctHealthy: "",
+    avgCoolerTemp30d: "",
+    avgFreezerTemp30d: "",
   };
 }
 

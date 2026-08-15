@@ -13,6 +13,8 @@ export type OrgHistoryPoint = {
   notConnected7Days: number;
   neverConnected: number;
   totalSensors: number;
+  avgCoolerTemp30d: number | null;
+  avgFreezerTemp30d: number | null;
 };
 
 export type OrgFleetDelta = {
@@ -21,6 +23,8 @@ export type OrgFleetDelta = {
   notConnected7Days: number;
   neverConnected: number;
   totalSensors: number;
+  avgCoolerTemp30d: number | null;
+  avgFreezerTemp30d: number | null;
 };
 
 export type TagTrendRow = {
@@ -102,7 +106,7 @@ export function formatDelta(value: number | null, suffix = "", decimals = 1): st
   if (value == null || !Number.isFinite(value)) return "—";
   if (value === 0) return `0${suffix}`;
   const sign = value > 0 ? "+" : "";
-  const n = suffix === "%" ? value.toFixed(decimals) : String(value);
+  const n = suffix === "%" || suffix === "°F" ? value.toFixed(decimals) : String(value);
   return `${sign}${n}${suffix}`;
 }
 
